@@ -310,11 +310,30 @@ function createWorker(self) {
     let depthIndex = new Uint32Array();
     let lastVertexCount = 0;
     let sortRunning;
+    // Dynamic scenes store the FreeTimeGS parameters in this layout per point:
+    // velocity.xyz, acceleration.xyz, canonical time, log(duration).
+    // Keep it in the worker for time-aware depth sorting and send a copied GPU
+    // texture to the main thread once after decoding.
+    let dynamicBuffer = null;
+    // Mobile-GS2 models keep their exact decoded covariance here.  The legacy
+    // 32-byte splat buffer stores rotation as uint8, which is not precise
+    // enough to rebuild thin anisotropic Gaussians faithfully.
+    let covarianceBuffer = null;
+    let dynamicShState = null;
+    let dynamicTime = 0;
+    let lastDynamicSortTime = Number.NaN;
+    let pendingDynamicFrame = null;
+    const DYNAMIC_TEX_WIDTH = 2048;
 
     let tmc3Module = null;
     let pendingMobileGS = null;
     const reportProgress = (phase, percent) => {
         postMessage({ progress: { phase, percent } });
+    };
+    const reportError = (error) => {
+        const message = error && error.message ? error.message : String(error);
+        console.error(message);
+        postMessage({ error: message });
     };
 
     try {
@@ -335,7 +354,7 @@ function createWorker(self) {
                         buffer = await processMobileGSData(pendingMobileGS.buffer);
                         postMessage({ buffer: buffer, save: pendingMobileGS.save });
                         throttledSort();
-                    } catch(e) { console.error("Delayed Mobile-GS Decode Error:", e); }
+                    } catch(e) { reportError(e); }
                     pendingMobileGS = null;
                 }
             }
@@ -438,6 +457,92 @@ function contractToUnisphereInPlace(x, y, z, out) {
         return (floatToHalf(x) | (floatToHalf(y) << 16)) >>> 0;
     }
 
+    function writeSHFlatToTexture(sh_f_buffer, vertexIndex, flatShs) {
+        const shOff = vertexIndex * 12;
+        sh_f_buffer[shOff + 0] = flatShs[0];
+        sh_f_buffer[shOff + 1] = flatShs[3];
+        sh_f_buffer[shOff + 2] = flatShs[6];
+        sh_f_buffer[shOff + 3] = flatShs[9];
+        sh_f_buffer[shOff + 4] = flatShs[1];
+        sh_f_buffer[shOff + 5] = flatShs[4];
+        sh_f_buffer[shOff + 6] = flatShs[7];
+        sh_f_buffer[shOff + 7] = flatShs[10];
+        sh_f_buffer[shOff + 8] = flatShs[2];
+        sh_f_buffer[shOff + 9] = flatShs[5];
+        sh_f_buffer[shOff + 10] = flatShs[8];
+        sh_f_buffer[shOff + 11] = flatShs[11];
+    }
+
+    function createShTexturePayload() {
+        if (!shBuffer) return null;
+        const texwidth_sh = 8192;
+        const texheight_sh = Math.ceil((vertexCount * 3) / texwidth_sh);
+        const texdata_sh = new Float32Array(texwidth_sh * texheight_sh * 4);
+        texdata_sh.set(new Float32Array(shBuffer));
+        return { texdata_sh, texwidth_sh, texheight_sh };
+    }
+
+    function updateDynamicShBuffer(time) {
+        if (!dynamicShState || !dynamicBuffer || !buffer || !shBuffer) return false;
+        if (Number.isFinite(dynamicShState.lastTime) &&
+            Math.abs(dynamicShState.lastTime - time) <= 1e-6) {
+            return false;
+        }
+
+        const f_buffer = new Float32Array(buffer);
+        const sh_f_buffer = new Float32Array(shBuffer);
+        const {
+            baseShs,
+            offsetInput,
+            mlpOffset,
+        } = dynamicShState;
+        const feat1 = new Float32Array(mlpOffset['main.0.bias'].length);
+        const feat2 = new Float32Array(mlpOffset['main.2.bias'].length);
+        const feat3 = new Float32Array(mlpOffset['main.4.bias'].length);
+        const sh_offset = new Float32Array(mlpOffset['shs_output.0.bias'].length);
+        const shsnn_input = new Float32Array(23);
+        const finalShs = new Float32Array(12);
+
+        for (let i = 0; i < vertexCount; i++) {
+            const inputOffset = i * 20;
+            for (let j = 0; j < 16; j++) {
+                shsnn_input[j] = offsetInput[inputOffset + j];
+            }
+
+            let x = f_buffer[8 * i + 0];
+            let y = f_buffer[8 * i + 1];
+            let z = f_buffer[8 * i + 2];
+            const dynamicOffset = i * 8;
+            const dt = time - dynamicBuffer[dynamicOffset + 6];
+            const halfDtSquared = 0.5 * dt * dt;
+            x += dynamicBuffer[dynamicOffset + 0] * dt + dynamicBuffer[dynamicOffset + 3] * halfDtSquared;
+            y += dynamicBuffer[dynamicOffset + 1] * dt + dynamicBuffer[dynamicOffset + 4] * halfDtSquared;
+            z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
+
+            shsnn_input[16] = x;
+            shsnn_input[17] = y;
+            shsnn_input[18] = z;
+            shsnn_input[19] = offsetInput[inputOffset + 16];
+            shsnn_input[20] = offsetInput[inputOffset + 17];
+            shsnn_input[21] = offsetInput[inputOffset + 18];
+            shsnn_input[22] = offsetInput[inputOffset + 19];
+
+            runPyTorch_MLP(shsnn_input, mlpOffset['main.0.weight'], mlpOffset['main.0.bias'], true, feat1);
+            runPyTorch_MLP(feat1, mlpOffset['main.2.weight'], mlpOffset['main.2.bias'], true, feat2);
+            runPyTorch_MLP(feat2, mlpOffset['main.4.weight'], mlpOffset['main.4.bias'], true, feat3);
+            runPyTorch_MLP(feat3, mlpOffset['shs_output.0.weight'], mlpOffset['shs_output.0.bias'], false, sh_offset);
+
+            const shOffset = i * 12;
+            for (let j = 0; j < 12; j++) {
+                finalShs[j] = baseShs[shOffset + j] + sh_offset[j];
+            }
+            writeSHFlatToTexture(sh_f_buffer, i, finalShs);
+        }
+
+        dynamicShState.lastTime = time;
+        return true;
+    }
+
     function generateTexture() {
         if (!buffer) return;
         const f_buffer = new Float32Array(buffer);
@@ -449,17 +554,13 @@ function contractToUnisphereInPlace(x, y, z, out) {
         var texdata_c = new Uint8Array(texdata.buffer);
         var texdata_f = new Float32Array(texdata.buffer);
 
-        let texdata_sh = null, texwidth_sh = 1, texheight_sh = 1;
+        let shPayload = null;
+        let texdata_dynamic = null, texwidth_dynamic = 1, texheight_dynamic = 1;
+        const hasExactCovariance = covarianceBuffer &&
+            covarianceBuffer.length === vertexCount * 6;
 
         if (shBuffer) {
-            texwidth_sh = 8192; 
-            // Each vertex uses 3 pixels (one vec4 per color channel)
-            texheight_sh = Math.ceil((vertexCount * 3) / texwidth_sh); 
-            texdata_sh = new Float32Array(texwidth_sh * texheight_sh * 4);
-
-            const sh_f_buffer = new Float32Array(shBuffer);
-            // Simple copy: sh_f_buffer is already ordered correctly
-            texdata_sh.set(sh_f_buffer);
+            shPayload = createShTexturePayload();
             
             // texwidth_sh = 8192; 
             // const shRowLength = 12; 
@@ -484,6 +585,30 @@ function contractToUnisphereInPlace(x, y, z, out) {
             // }
         }
 
+        if (dynamicBuffer) {
+            // The CPU buffer follows Mobile-GS2 decode order:
+            // velocity.xyz, acceleration.xyz, canonical time, log(duration).
+            // The shader reads two vec4s as velocity+time and
+            // acceleration+duration, so repack while uploading.
+            texwidth_dynamic = DYNAMIC_TEX_WIDTH;
+            texheight_dynamic = Math.ceil((vertexCount * 2) / texwidth_dynamic);
+            texdata_dynamic = new Float32Array(
+                texwidth_dynamic * texheight_dynamic * 4,
+            );
+            for (let i = 0; i < vertexCount; i++) {
+                const source = i * 8;
+                const target = i * 8;
+                texdata_dynamic[target + 0] = dynamicBuffer[source + 0];
+                texdata_dynamic[target + 1] = dynamicBuffer[source + 1];
+                texdata_dynamic[target + 2] = dynamicBuffer[source + 2];
+                texdata_dynamic[target + 3] = dynamicBuffer[source + 6];
+                texdata_dynamic[target + 4] = dynamicBuffer[source + 3];
+                texdata_dynamic[target + 5] = dynamicBuffer[source + 4];
+                texdata_dynamic[target + 6] = dynamicBuffer[source + 5];
+                texdata_dynamic[target + 7] = dynamicBuffer[source + 7];
+            }
+        }
+
         // Here we convert from a .splat file buffer into a texture
         // With a little bit more foresight perhaps this texture file
         // should have been the native format as it'd be very easy to
@@ -499,6 +624,23 @@ function contractToUnisphereInPlace(x, y, z, out) {
             texdata_c[4 * (8 * i + 7) + 1] = u_buffer[32 * i + 24 + 1];
             texdata_c[4 * (8 * i + 7) + 2] = u_buffer[32 * i + 24 + 2];
             texdata_c[4 * (8 * i + 7) + 3] = u_buffer[32 * i + 24 + 3];
+
+            if (hasExactCovariance) {
+                const covarianceOffset = i * 6;
+                texdata[8 * i + 4] = packHalf2x16(
+                    covarianceBuffer[covarianceOffset + 0],
+                    covarianceBuffer[covarianceOffset + 1],
+                );
+                texdata[8 * i + 5] = packHalf2x16(
+                    covarianceBuffer[covarianceOffset + 2],
+                    covarianceBuffer[covarianceOffset + 3],
+                );
+                texdata[8 * i + 6] = packHalf2x16(
+                    covarianceBuffer[covarianceOffset + 4],
+                    covarianceBuffer[covarianceOffset + 5],
+                );
+                continue;
+            }
 
             // Scale data at offset 12-23 in buffer (3 float32 values)
             let scale = [
@@ -539,28 +681,55 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 M[2] * M[2] + M[5] * M[5] + M[8] * M[8],
             ];
 
-            // Store covariance data in pixel 1 (same as main.js)
-            texdata[8 * i + 4] = packHalf2x16(4 * sigma[0], 4 * sigma[1]);
-            texdata[8 * i + 5] = packHalf2x16(4 * sigma[2], 4 * sigma[3]);
-            texdata[8 * i + 6] = packHalf2x16(4 * sigma[4], 4 * sigma[5]);
+            // Mobile-GS2's rasterizer consumes the physical covariance
+            // directly.  Pixel-to-NDC conversion is handled explicitly in
+            // the vertex shader, rather than folding it into this texture.
+            texdata[8 * i + 4] = packHalf2x16(sigma[0], sigma[1]);
+            texdata[8 * i + 5] = packHalf2x16(sigma[2], sigma[3]);
+            texdata[8 * i + 6] = packHalf2x16(sigma[4], sigma[5]);
         }
 
-        console.log("Sending texture data: main", texwidth, "x", texheight, ", SH", texwidth_sh, "x", texheight_sh);
+        console.log(
+            "Sending texture data: main",
+            texwidth,
+            "x",
+            texheight,
+            ", SH",
+            shPayload ? shPayload.texwidth_sh : 1,
+            "x",
+            shPayload ? shPayload.texheight_sh : 1,
+        );
         self.postMessage({ texdata, texwidth, texheight }, [texdata.buffer]);
-        if (texdata_sh) {
-            self.postMessage({ texdata_sh, texwidth_sh, texheight_sh }, [texdata_sh.buffer]);
+        if (shPayload) {
+            self.postMessage(shPayload, [shPayload.texdata_sh.buffer]);
         }
+        if (texdata_dynamic) {
+            self.postMessage(
+                { texdata_dynamic, texwidth_dynamic, texheight_dynamic },
+                [texdata_dynamic.buffer],
+            );
+        }
+        self.postMessage({
+            dynamic: {
+                enabled: Boolean(dynamicBuffer),
+                time: dynamicTime,
+            },
+        });
     }
 
     function runSort(viewProj) {
         if (!buffer) return;
         const f_buffer = new Float32Array(buffer);
+        const hasDynamicMotion = dynamicBuffer && dynamicBuffer.length === vertexCount * 8;
+        const dynamicTimeChanged =
+            hasDynamicMotion &&
+            (!Number.isFinite(lastDynamicSortTime) || Math.abs(dynamicTime - lastDynamicSortTime) > 1e-6);
         if (lastVertexCount == vertexCount) {
             let dot =
                 lastProj[2] * viewProj[2] +
                 lastProj[6] * viewProj[6] +
                 lastProj[10] * viewProj[10];
-            if (Math.abs(dot - 1) < 0.01) {
+            if (Math.abs(dot - 1) < 0.01 && !dynamicTimeChanged && !pendingDynamicFrame) {
                 return;
             }
         } else {
@@ -573,11 +742,19 @@ function contractToUnisphereInPlace(x, y, z, out) {
         let minDepth = Infinity;
         let sizeList = new Int32Array(vertexCount);
         for (let i = 0; i < vertexCount; i++) {
+            let x = f_buffer[8 * i + 0];
+            let y = f_buffer[8 * i + 1];
+            let z = f_buffer[8 * i + 2];
+            if (hasDynamicMotion) {
+                const dynamicOffset = i * 8;
+                const dt = dynamicTime - dynamicBuffer[dynamicOffset + 6];
+                const halfDtSquared = 0.5 * dt * dt;
+                x += dynamicBuffer[dynamicOffset + 0] * dt + dynamicBuffer[dynamicOffset + 3] * halfDtSquared;
+                y += dynamicBuffer[dynamicOffset + 1] * dt + dynamicBuffer[dynamicOffset + 4] * halfDtSquared;
+                z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
+            }
             let depth =
-                ((viewProj[2] * f_buffer[8 * i + 0] +
-                    viewProj[6] * f_buffer[8 * i + 1] +
-                    viewProj[10] * f_buffer[8 * i + 2]) *
-                    4096) |
+                ((viewProj[2] * x + viewProj[6] * y + viewProj[10] * z) * 4096) |
                 0;
             sizeList[i] = depth;
             if (depth > maxDepth) maxDepth = depth;
@@ -601,9 +778,19 @@ function contractToUnisphereInPlace(x, y, z, out) {
         console.timeEnd("sort");
 
         lastProj = viewProj;
-        self.postMessage({ depthIndex, viewProj, vertexCount }, [
-            depthIndex.buffer,
-        ]);
+        lastDynamicSortTime = hasDynamicMotion ? dynamicTime : Number.NaN;
+        const message = { depthIndex, viewProj, vertexCount };
+        const transfer = [depthIndex.buffer];
+        if (pendingDynamicFrame) {
+            message.dynamicRequestId = pendingDynamicFrame.requestId;
+            message.dynamicTime = pendingDynamicFrame.time;
+            if (pendingDynamicFrame.shPayload) {
+                message.dynamicSh = pendingDynamicFrame.shPayload;
+                transfer.push(pendingDynamicFrame.shPayload.texdata_sh.buffer);
+            }
+            pendingDynamicFrame = null;
+        }
+        self.postMessage(message, transfer);
     }
 
     const throttledSort = () => {
@@ -613,7 +800,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
             runSort(lastView);
             setTimeout(() => {
                 sortRunning = false;
-                if (lastView !== viewProj) throttledSort();
+                if (lastView !== viewProj || pendingDynamicFrame) throttledSort();
             }, 0);
         }
     };
@@ -666,7 +853,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
     
     }
 
-   function decodeHuffmanBitstream(bitstream, htable) {
+   function decodeHuffmanBitstream(bitstream, htable, expectedCount = null) {
         // Build a high-performance binary tree
         const root = { val: null, left: null, right: null };
         
@@ -700,8 +887,21 @@ function contractToUnisphereInPlace(x, y, z, out) {
             for (let b = 7; b >= 0; b--) {
                 let bit = (byte >> b) & 1;
                 node = bit ? node.right : node.left;
+                if (!node) {
+                    // The only bits after a complete payload are byte padding.
+                    // With a known point count we can safely ignore a padding
+                    // path that is not a Huffman code; otherwise report a
+                    // malformed stream instead of dereferencing null.
+                    if (expectedCount !== null && indices.length >= expectedCount) {
+                        return indices;
+                    }
+                    throw new Error("Invalid Huffman bitstream.");
+                }
                 if (node.val !== null) {
                     indices.push(node.val);
+                    if (expectedCount !== null && indices.length === expectedCount) {
+                        return indices;
+                    }
                     node = root; // Reset to root for next code
                 }
             }
@@ -711,37 +911,144 @@ function contractToUnisphereInPlace(x, y, z, out) {
 
 
 
-    function decodeVQAttributesConcat(indexBitstreams, htables, codebookArrays) {
-    let chunks = [];
-    let totalDim = 0;
-    let numPoints = 0;
-
-    // Process each codebook level
-    for (let c = 0; c < indexBitstreams.length; c++) {
-        let indices = decodeHuffmanBitstream(indexBitstreams[c], htables[c]);
-        if (numPoints === 0) numPoints = indices.length;
-
-        // Use the mathematically guaranteed dimension from Python metadata
-        let featureDim = codebookArrays[c].shape[1]; 
-        
-        chunks.push({ indices, codebook: codebookArrays[c], dim: featureDim });
-        totalDim += featureDim;
-    }
-
-    // FIX 2: Mimic PyTorch torch.cat(..., dim=-1)
-    let features = new Float32Array(numPoints * totalDim);
-    for (let i = 0; i < numPoints; i++) {
-        let currentOffset = 0;
-        for (let c = 0; c < chunks.length; c++) {
-            let chunk = chunks[c];
-            let clusterIdx = chunk.indices[i];
-            for (let j = 0; j < chunk.dim; j++) {
-                features[i * totalDim + currentOffset + j] = chunk.codebook[clusterIdx * chunk.dim + j];
-            }
-            currentOffset += chunk.dim;
+    function decodeVQAttributesConcat(indexBitstreams, htables, codebookArrays, expectedPointCount = null) {
+        if (!Array.isArray(indexBitstreams) || !Array.isArray(htables) || !Array.isArray(codebookArrays) ||
+            indexBitstreams.length === 0 || indexBitstreams.length !== htables.length ||
+            indexBitstreams.length !== codebookArrays.length) {
+            throw new Error("Invalid VQ attribute stream.");
         }
+
+        const chunks = [];
+        let totalDim = 0;
+        let numPoints = expectedPointCount;
+
+        // Process each codebook level.  Huffman byte padding can decode to a
+        // harmless trailing symbol, so use the known Gaussian count whenever
+        // it is available instead of treating the bitstream length as truth.
+        for (let c = 0; c < indexBitstreams.length; c++) {
+            const indices = decodeHuffmanBitstream(indexBitstreams[c], htables[c], numPoints);
+            if (numPoints === null) numPoints = indices.length;
+            if (indices.length < numPoints) {
+                throw new Error(`VQ attribute stream ${c} has ${indices.length} entries; expected ${numPoints}.`);
+            }
+
+            const codebook = codebookArrays[c];
+            const featureDim = codebook.shape && codebook.shape.length > 1
+                ? codebook.shape[1]
+                : 1;
+            if (!Number.isInteger(featureDim) || featureDim <= 0) {
+                throw new Error(`Invalid VQ codebook dimension for stream ${c}.`);
+            }
+            chunks.push({ indices, codebook, dim: featureDim });
+            totalDim += featureDim;
+        }
+
+        const features = new Float32Array(numPoints * totalDim);
+        for (let i = 0; i < numPoints; i++) {
+            let currentOffset = 0;
+            for (let c = 0; c < chunks.length; c++) {
+                const chunk = chunks[c];
+                const clusterIdx = chunk.indices[i];
+                for (let j = 0; j < chunk.dim; j++) {
+                    features[i * totalDim + currentOffset + j] =
+                        chunk.codebook[clusterIdx * chunk.dim + j];
+                }
+                currentOffset += chunk.dim;
+            }
+        }
+        return features;
     }
-    return features;
+
+    function packDynamicAttributes(attributes, pointCount, attributeDim) {
+        if (!Number.isInteger(attributeDim) || attributeDim < 5 ||
+            attributes.length < pointCount * attributeDim) {
+            throw new Error("Dynamic attributes are incomplete or use an unsupported layout.");
+        }
+
+        const packed = new Float32Array(pointCount * 8);
+        for (let i = 0; i < pointCount; i++) {
+            const source = i * attributeDim;
+            const target = i * 8;
+            packed[target + 0] = attributes[source + 0];
+            packed[target + 1] = attributes[source + 1];
+            packed[target + 2] = attributes[source + 2];
+
+            if (attributeDim >= 8) {
+                packed[target + 3] = attributes[source + 3];
+                packed[target + 4] = attributes[source + 4];
+                packed[target + 5] = attributes[source + 5];
+                packed[target + 6] = attributes[source + 6];
+                packed[target + 7] = attributes[source + 7];
+            } else {
+                // Older Mobile-GS2 exports contain velocity, time, duration
+                // and implicitly use zero acceleration.
+                packed[target + 3] = 0;
+                packed[target + 4] = 0;
+                packed[target + 5] = 0;
+                packed[target + 6] = attributes[source + 3];
+                packed[target + 7] = attributes[source + 4];
+            }
+        }
+        return packed;
+    }
+
+    function getDynamicRowWidth(attribute, pointCount, name) {
+        if (!attribute || typeof attribute.length !== "number") {
+            throw new Error(`Dynamic model is missing ${name}.`);
+        }
+        const shape = attribute.shape;
+        const width = shape && shape.length > 1
+            ? Number(shape[shape.length - 1])
+            : attribute.length / pointCount;
+        if (!Number.isInteger(width) || width <= 0 || attribute.length < pointCount * width) {
+            throw new Error(`Dynamic ${name} has an invalid shape.`);
+        }
+        return width;
+    }
+
+    function decodeDynamicAttributes(save_dict, pointCount) {
+        if (!save_dict.dynamic_enabled) return null;
+
+        if (Array.isArray(save_dict.dynamic_code) && save_dict.dynamic_code.length > 0) {
+            const attributes = decodeVQAttributesConcat(
+                save_dict.dynamic_index,
+                save_dict.dynamic_htable,
+                save_dict.dynamic_code,
+                pointCount,
+            );
+            const attributeDim = attributes.length / pointCount;
+            return packDynamicAttributes(attributes, pointCount, attributeDim);
+        }
+
+        // The decoder also accepts the pre-VQ export shape used by older
+        // checkpoints: velocity[, acceleration], time, duration.
+        const velocityWidth = getDynamicRowWidth(save_dict.velocity, pointCount, "velocity");
+        if (velocityWidth < 3) throw new Error("Dynamic velocity must have three components.");
+        const acceleration = save_dict.acceleration;
+        const accelerationWidth = acceleration
+            ? getDynamicRowWidth(acceleration, pointCount, "acceleration")
+            : 0;
+        if (acceleration && accelerationWidth < 3) {
+            throw new Error("Dynamic acceleration must have three components.");
+        }
+        const timeWidth = getDynamicRowWidth(save_dict.time, pointCount, "time");
+        const durationWidth = getDynamicRowWidth(save_dict.duration, pointCount, "duration");
+        const packed = new Float32Array(pointCount * 8);
+
+        for (let i = 0; i < pointCount; i++) {
+            const target = i * 8;
+            const velocityOffset = i * velocityWidth;
+            const accelerationOffset = i * accelerationWidth;
+            packed[target + 0] = save_dict.velocity[velocityOffset + 0];
+            packed[target + 1] = save_dict.velocity[velocityOffset + 1];
+            packed[target + 2] = save_dict.velocity[velocityOffset + 2];
+            packed[target + 3] = acceleration ? acceleration[accelerationOffset + 0] : 0;
+            packed[target + 4] = acceleration ? acceleration[accelerationOffset + 1] : 0;
+            packed[target + 5] = acceleration ? acceleration[accelerationOffset + 2] : 0;
+            packed[target + 6] = save_dict.time[i * timeWidth];
+            packed[target + 7] = save_dict.duration[i * durationWidth];
+        }
+        return packed;
     }
 
 
@@ -804,7 +1111,11 @@ function contractToUnisphere(x, y, z) {
     const paddedOut = pad16(outDim);
     
     tcnn_current.fill(0);
-    tcnn_current.set(inputVector); 
+    tcnn_current.set(inputVector);
+    // tiny-cuda-nn's IdentityEncoding writes `1` into dimensions added to
+    // satisfy the FullyFusedMLP alignment. MLP_rotation has 13 + 2 inputs in
+    // the reference model, so its sixteenth input must not be zero.
+    for (let i = inDim; i < paddedIn; i++) tcnn_current[i] = 1.0;
     let offset = 0;
 
     const applyActivation = (val) => {
@@ -865,6 +1176,16 @@ function contractToUnisphere(x, y, z) {
     async function processMobileGSData(arrayBuffer) {
         reportProgress("decompose", 55);
         const save_dict = parseMobileGSFile(arrayBuffer);
+        // Clear motion state before each model so loading a static model after a
+        // dynamic one cannot accidentally reuse the previous motion texture.
+        dynamicBuffer = null;
+        covarianceBuffer = null;
+        dynamicShState = null;
+        dynamicTime = 0;
+        lastDynamicSortTime = Number.NaN;
+        pendingDynamicFrame = null;
+        lastVertexCount = 0;
+        lastProj = [];
         if (!tmc3Module) throw new Error("TMC3 WASM not ready.");
 
         const fileSystem = tmc3Module.FS || self.FS;
@@ -996,17 +1317,32 @@ function contractToUnisphere(x, y, z) {
             xyz_float[i * 3 + 2] = xyz_raw_float[old_idx * 3 + 2];
         }
         console.time("VQ Decode");
-        const scale = decodeVQAttributesConcat(save_dict['scale_index'], save_dict['scale_htable'], save_dict['scale_code']);
-        const rotation = decodeVQAttributesConcat(save_dict['rotation_index'], save_dict['rotation_htable'], save_dict['rotation_code']);
-        const appearance = decodeVQAttributesConcat(save_dict['app_index'], save_dict['app_htable'], save_dict['app_code']);
+        const scale = decodeVQAttributesConcat(save_dict['scale_index'], save_dict['scale_htable'], save_dict['scale_code'], vertexCount);
+        const rotation = decodeVQAttributesConcat(save_dict['rotation_index'], save_dict['rotation_htable'], save_dict['rotation_code'], vertexCount);
+        const appearance = decodeVQAttributesConcat(save_dict['app_index'], save_dict['app_htable'], save_dict['app_code'], vertexCount);
+        dynamicBuffer = decodeDynamicAttributes(save_dict, vertexCount);
+        const hasDynamicModel = Boolean(dynamicBuffer);
+        const rotationFeatureDim = rotation.length / vertexCount;
+        const serializedRotationFeatureDim = Number(save_dict['rot_feature_dim']);
+        if (!Number.isInteger(rotationFeatureDim) || rotationFeatureDim <= 0 ||
+            (Number.isFinite(serializedRotationFeatureDim) &&
+                serializedRotationFeatureDim !== rotationFeatureDim)) {
+            throw new Error("Rotation feature stream does not match the Mobile-GS2 metadata.");
+        }
+        const hasRotationMLP = Boolean(save_dict['MLP_rotation'] && save_dict['MLP_rotation'].length);
+        if (!hasRotationMLP && rotationFeatureDim !== 4) {
+            throw new Error("This model stores rotation features but does not include MLP_rotation.");
+        }
         console.timeEnd("VQ Decode");
         reportProgress("decompose", 78);
 
         buffer = new ArrayBuffer(vertexCount * 32);
         const f_buffer = new Float32Array(buffer);
         const u_buffer = new Uint8Array(buffer);
+        covarianceBuffer = new Float32Array(vertexCount * 6);
         shBuffer = new ArrayBuffer(vertexCount * 48); 
-        const shDataView = new DataView(shBuffer);
+        const dynamicBaseShs = hasDynamicModel ? new Float32Array(vertexCount * 12) : null;
+        const dynamicOffsetInput = hasDynamicModel ? new Float32Array(vertexCount * 20) : null;
 
         const encoded_xyz = new Float32Array(96);
         const cont_feature = new Float32Array(13);
@@ -1028,6 +1364,7 @@ function contractToUnisphere(x, y, z) {
         const scales_raw = new Float32Array(3);
         const scales_norm = new Float32Array(3);
         const rot_raw = new Float32Array(4);
+        const rot_input = new Float32Array(13 + rotationFeatureDim);
         const shsnn_input = new Float32Array(23); // 12 + 1 + 3 + 3 + 4 = 23
         const sh_f_buffer = new Float32Array(shBuffer); // Direct array view (Drops DataView overhead)
         
@@ -1055,6 +1392,31 @@ function contractToUnisphere(x, y, z) {
 
             getTCNNFrequencyEncoding(uni_coords[0], uni_coords[1], uni_coords[2], 16, encoded_xyz); 
             runTCNN_MLP(encoded_xyz, save_dict['MLP_cont'], 96, 64, 13, 1, 'ReLU', cont_feature);
+
+            // Mobile-GS2 VQ-compresses _features_rot, not a quaternion.  The
+            // reference decoder recovers the rotation with MLP_rotation before
+            // normalizing it; only legacy exports store four raw components.
+            if (hasRotationMLP) {
+                rot_input.set(cont_feature, 0);
+                for (let j = 0; j < rotationFeatureDim; j++) {
+                    rot_input[13 + j] = rotation[i * rotationFeatureDim + j];
+                }
+                runTCNN_MLP(
+                    rot_input,
+                    save_dict['MLP_rotation'],
+                    13 + rotationFeatureDim,
+                    64,
+                    4,
+                    1,
+                    'LeakyReLU',
+                    rot_raw,
+                );
+            } else {
+                rot_raw[0] = rotation[i * 4 + 0];
+                rot_raw[1] = rotation[i * 4 + 1];
+                rot_raw[2] = rotation[i * 4 + 2];
+                rot_raw[3] = rotation[i * 4 + 3];
+            }
             
             space_feature.set(cont_feature);
             space_feature[13] = app0; space_feature[14] = app1; space_feature[15] = app2;
@@ -1085,35 +1447,73 @@ function contractToUnisphere(x, y, z) {
             scales_raw[0] = act_scale_x; scales_raw[1] = act_scale_y; scales_raw[2] = act_scale_z;
             normalizeTensorInPlace(scales_raw, scales_norm); 
             
-            let r0 = rotation[i*4], r1 = rotation[i*4+1], r2 = rotation[i*4+2], r3 = rotation[i*4+3];
+            let r0 = rot_raw[0], r1 = rot_raw[1], r2 = rot_raw[2], r3 = rot_raw[3];
             let rot_mag = Math.hypot(r0, r1, r2, r3) || 1e-8;
             let act_rot_0 = r0 / rot_mag;
             let act_rot_1 = r1 / rot_mag;
             let act_rot_2 = r2 / rot_mag;
             let act_rot_3 = r3 / rot_mag;
 
-            shsnn_input.set(shs_norm, 0);       
-            shsnn_input[12] = act_opacity;      
-            shsnn_input.set(scales_norm, 13);   
-            
-            shsnn_input[16] = x; shsnn_input[17] = y; shsnn_input[18] = z;
-            shsnn_input[19] = act_rot_0; shsnn_input[20] = act_rot_1; 
-            shsnn_input[21] = act_rot_2; shsnn_input[22] = act_rot_3;
+            // Match Mobile-GS2's computeCov3D: form the scale/rotation
+            // matrix from the exact decoded quaternion and store its six
+            // symmetric covariance terms before the legacy uint8 packing.
+            const m0 = (1.0 - 2.0 * (act_rot_2 * act_rot_2 + act_rot_3 * act_rot_3)) * act_scale_x;
+            const m1 = (2.0 * (act_rot_1 * act_rot_2 + act_rot_0 * act_rot_3)) * act_scale_x;
+            const m2 = (2.0 * (act_rot_1 * act_rot_3 - act_rot_0 * act_rot_2)) * act_scale_x;
+            const m3 = (2.0 * (act_rot_1 * act_rot_2 - act_rot_0 * act_rot_3)) * act_scale_y;
+            const m4 = (1.0 - 2.0 * (act_rot_1 * act_rot_1 + act_rot_3 * act_rot_3)) * act_scale_y;
+            const m5 = (2.0 * (act_rot_2 * act_rot_3 + act_rot_0 * act_rot_1)) * act_scale_y;
+            const m6 = (2.0 * (act_rot_1 * act_rot_3 + act_rot_0 * act_rot_2)) * act_scale_z;
+            const m7 = (2.0 * (act_rot_2 * act_rot_3 - act_rot_0 * act_rot_1)) * act_scale_z;
+            const m8 = (1.0 - 2.0 * (act_rot_1 * act_rot_1 + act_rot_2 * act_rot_2)) * act_scale_z;
+            const covarianceOffset = i * 6;
+            covarianceBuffer[covarianceOffset + 0] = m0 * m0 + m3 * m3 + m6 * m6;
+            covarianceBuffer[covarianceOffset + 1] = m0 * m1 + m3 * m4 + m6 * m7;
+            covarianceBuffer[covarianceOffset + 2] = m0 * m2 + m3 * m5 + m6 * m8;
+            covarianceBuffer[covarianceOffset + 3] = m1 * m1 + m4 * m4 + m7 * m7;
+            covarianceBuffer[covarianceOffset + 4] = m1 * m2 + m4 * m5 + m7 * m8;
+            covarianceBuffer[covarianceOffset + 5] = m2 * m2 + m5 * m5 + m8 * m8;
 
+            if (hasDynamicModel) {
+                const baseOffset = i * 12;
+                for (let j = 0; j < 12; j++) {
+                    dynamicBaseShs[baseOffset + j] = shs_flat[j];
+                }
 
-            runPyTorch_MLP(shsnn_input, save_dict['MLP_offset']['main.0.weight'], save_dict['MLP_offset']['main.0.bias'], true, feat1);
-            runPyTorch_MLP(feat1, save_dict['MLP_offset']['main.2.weight'], save_dict['MLP_offset']['main.2.bias'], true, feat2);
-            runPyTorch_MLP(feat2, save_dict['MLP_offset']['main.4.weight'], save_dict['MLP_offset']['main.4.bias'], true, feat3);
-            runPyTorch_MLP(feat3, save_dict['MLP_offset']['shs_output.0.weight'], save_dict['MLP_offset']['shs_output.0.bias'], false, sh_offset);
+                const inputOffset = i * 20;
+                for (let j = 0; j < 12; j++) {
+                    dynamicOffsetInput[inputOffset + j] = shs_norm[j];
+                }
+                dynamicOffsetInput[inputOffset + 12] = act_opacity;
+                dynamicOffsetInput[inputOffset + 13] = scales_norm[0];
+                dynamicOffsetInput[inputOffset + 14] = scales_norm[1];
+                dynamicOffsetInput[inputOffset + 15] = scales_norm[2];
+                dynamicOffsetInput[inputOffset + 16] = act_rot_0;
+                dynamicOffsetInput[inputOffset + 17] = act_rot_1;
+                dynamicOffsetInput[inputOffset + 18] = act_rot_2;
+                dynamicOffsetInput[inputOffset + 19] = act_rot_3;
+            } else {
+                shsnn_input.set(shs_norm, 0);       
+                shsnn_input[12] = act_opacity;      
+                shsnn_input.set(scales_norm, 13);   
+                
+                shsnn_input[16] = x; shsnn_input[17] = y; shsnn_input[18] = z;
+                shsnn_input[19] = act_rot_0; shsnn_input[20] = act_rot_1; 
+                shsnn_input[21] = act_rot_2; shsnn_input[22] = act_rot_3;
 
+                runPyTorch_MLP(shsnn_input, save_dict['MLP_offset']['main.0.weight'], save_dict['MLP_offset']['main.0.bias'], true, feat1);
+                runPyTorch_MLP(feat1, save_dict['MLP_offset']['main.2.weight'], save_dict['MLP_offset']['main.2.bias'], true, feat2);
+                runPyTorch_MLP(feat2, save_dict['MLP_offset']['main.4.weight'], save_dict['MLP_offset']['main.4.bias'], true, feat3);
+                runPyTorch_MLP(feat3, save_dict['MLP_offset']['shs_output.0.weight'], save_dict['MLP_offset']['shs_output.0.bias'], false, sh_offset);
 
-            _features_dc[0] += sh_offset[0]; 
-            _features_dc[1] += sh_offset[1]; 
-            _features_dc[2] += sh_offset[2];
-            for(let r = 0; r < 3; r++) {
-                _features_rest[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
-                _features_rest[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
-                _features_rest[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
+                _features_dc[0] += sh_offset[0]; 
+                _features_dc[1] += sh_offset[1]; 
+                _features_dc[2] += sh_offset[2];
+                for(let r = 0; r < 3; r++) {
+                    _features_rest[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
+                    _features_rest[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
+                    _features_rest[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
+                }
             }
 
             
@@ -1139,22 +1539,15 @@ function contractToUnisphere(x, y, z) {
             u_buffer[32 * i + 28 + 3] = Math.max(0, Math.min(255, act_rot_3 * 128 + 128));
 
  
-            const shOff = i * 12; 
-
-            sh_f_buffer[shOff + 0]  = _features_dc[0]; 
-            sh_f_buffer[shOff + 1]  = _features_rest[0]; // Coeff1_R
-            sh_f_buffer[shOff + 2]  = _features_rest[3]; // Coeff2_R
-            sh_f_buffer[shOff + 3]  = _features_rest[6]; // Coeff3_R
-
-            sh_f_buffer[shOff + 4]  = _features_dc[1]; 
-            sh_f_buffer[shOff + 5]  = _features_rest[1]; // Coeff1_G
-            sh_f_buffer[shOff + 6]  = _features_rest[4]; // Coeff2_G
-            sh_f_buffer[shOff + 7]  = _features_rest[7]; // Coeff3_G
-
-            sh_f_buffer[shOff + 8]  = _features_dc[2]; 
-            sh_f_buffer[shOff + 9]  = _features_rest[2]; // Coeff1_B
-            sh_f_buffer[shOff + 10] = _features_rest[5]; // Coeff2_B
-            sh_f_buffer[shOff + 11] = _features_rest[8]; // Coeff3_B
+            if (!hasDynamicModel) {
+                shs_flat[0] = _features_dc[0];
+                shs_flat[1] = _features_dc[1];
+                shs_flat[2] = _features_dc[2];
+                for (let j = 0; j < 9; j++) {
+                    shs_flat[3 + j] = _features_rest[j];
+                }
+                writeSHFlatToTexture(sh_f_buffer, i, shs_flat);
+            }
             
             
 
@@ -1177,6 +1570,15 @@ function contractToUnisphere(x, y, z) {
           
      
         console.timeEnd("Neural Decode Loop");
+        if (hasDynamicModel) {
+            dynamicShState = {
+                baseShs: dynamicBaseShs,
+                offsetInput: dynamicOffsetInput,
+                mlpOffset: save_dict['MLP_offset'],
+                lastTime: Number.NaN,
+            };
+            updateDynamicShBuffer(dynamicTime);
+        }
         reportProgress("decompose", 95);
         Object.keys(save_dict).forEach(key => delete save_dict[key]);
         return buffer;
@@ -1197,15 +1599,34 @@ function contractToUnisphere(x, y, z) {
                     postMessage({ buffer: buffer, save: !!e.data.save });
                     throttledSort();
                 } catch (err) {
-                    console.error("Mobile-GS Decode Error:", err);
+                    reportError(err);
                 }
             }
         } else if (e.data.buffer) {
             buffer = e.data.buffer;
             vertexCount = e.data.vertexCount;
+            covarianceBuffer = null;
         } else if (e.data.view) {
             viewProj = e.data.view;
             throttledSort();
+        } else if (Number.isFinite(e.data.time)) {
+            if (dynamicBuffer) {
+                const nextTime = e.data.time;
+                const timeChanged = Math.abs(dynamicTime - nextTime) > 1e-6;
+                dynamicTime = nextTime;
+                const shPayload = updateDynamicShBuffer(dynamicTime)
+                    ? createShTexturePayload()
+                    : null;
+                pendingDynamicFrame = {
+                    requestId: e.data.dynamicRequestId,
+                    time: dynamicTime,
+                    shPayload,
+                };
+                if (timeChanged) {
+                    lastDynamicSortTime = Number.NaN;
+                }
+                throttledSort();
+            }
         }
     };
 }
@@ -1216,10 +1637,13 @@ precision highp int;
 
 uniform highp usampler2D u_texture;
 uniform highp sampler2D u_sh_texture;
+uniform highp sampler2D u_dynamic_texture;
 uniform mat4 projection, view;
 uniform vec2 focal;
 uniform vec2 viewport;
 uniform vec3 camPos;
+uniform float u_time;
+uniform int u_dynamic_enabled;
 
 in vec2 position;
 in int index;
@@ -1254,6 +1678,16 @@ float computeSHChannel(vec3 dir, int channel, int vertexIndex) {
     result = result - SH_C1 * y * sh.y + SH_C1 * z * sh.z - SH_C1 * x * sh.w;
 
     return clamp(result + 0.5, 0.0, 1.0);
+}
+
+void getDynamicMotion(int vertexIndex, out vec4 motion, out vec4 temporal) {
+    const int dynamicTexWidth = 2048;
+    int firstPixel = vertexIndex * 2;
+    ivec2 firstCoord = ivec2(firstPixel % dynamicTexWidth, firstPixel / dynamicTexWidth);
+    int secondPixel = firstPixel + 1;
+    ivec2 secondCoord = ivec2(secondPixel % dynamicTexWidth, secondPixel / dynamicTexWidth);
+    motion = texelFetch(u_dynamic_texture, firstCoord, 0);
+    temporal = texelFetch(u_dynamic_texture, secondCoord, 0);
 }
 
 
@@ -1313,7 +1747,18 @@ float computeSHChannel(vec3 dir, int channel, int vertexIndex) {
 
 void main() {
     uvec4 cen = texelFetch(u_texture, ivec2((uint(index) & 0x3ffu) << 1, uint(index) >> 10), 0);
-    vec4 cam = view * vec4(uintBitsToFloat(cen.xyz), 1);
+    vec3 center_world = uintBitsToFloat(cen.xyz);
+    float temporalOpacity = 1.0;
+    if (u_dynamic_enabled != 0) {
+        vec4 motion;
+        vec4 temporal;
+        getDynamicMotion(index, motion, temporal);
+        float dt = u_time - motion.w;
+        center_world += motion.xyz * dt + 0.5 * temporal.xyz * dt * dt;
+        float duration = max(exp(temporal.w), 1e-4);
+        temporalOpacity = exp(-0.5 * pow(dt / (duration + 1e-8), 2.0));
+    }
+    vec4 cam = view * vec4(center_world, 1);
     vec4 pos2d = projection * cam;
 
     float clip = 1.2 * pos2d.w;
@@ -1334,6 +1779,10 @@ void main() {
 
     mat3 T = transpose(mat3(view)) * J;
     mat3 cov2d = transpose(T) * Vrk * T;
+    // Match Mobile-GS2's computeCov2D low-pass filter so very small
+    // Gaussians retain the reference renderer's minimum footprint.
+    cov2d[0][0] += 0.3;
+    cov2d[1][1] += 0.3;
 
     float mid = (cov2d[0][0] + cov2d[1][1]) / 2.0;
     float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
@@ -1344,22 +1793,24 @@ void main() {
     vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
     vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
 
-    vec3 center_world = uintBitsToFloat(cen.xyz);
     vec3 view_dir = normalize(center_world - camPos);
     
     float r = computeSHChannel(view_dir, 0, index);
     float g = computeSHChannel(view_dir, 1, index);
     float b = computeSHChannel(view_dir, 2, index);
 
-    float alpha = float((cov.w >> 24) & 0xffu) / 255.0;
+    float alpha = float((cov.w >> 24) & 0xffu) / 255.0 * temporalOpacity;
     vColor = vec4(r, g, b, alpha);
     vPosition = position;
 
     vec2 vCenter = vec2(pos2d) / pos2d.w;
+    // majorAxis/minorAxis are in framebuffer pixels.  NDC spans two units
+    // across the viewport, so convert pixels with 2 / viewport.  The former
+    // renderer implicitly did this by multiplying the covariance by four.
     gl_Position = vec4(
         vCenter
-        + position.x * majorAxis / viewport
-        + position.y * minorAxis / viewport, 0.0, 1.0);
+        + 2.0 * position.x * majorAxis / viewport
+        + 2.0 * position.y * minorAxis / viewport, 0.0, 1.0);
 
 }
 `.trim();
@@ -1425,6 +1876,11 @@ function ensureViewerDom() {
         <div id="caminfo">
             <span id="camid"></span>
         </div>
+        <div id="dynamic-controls" aria-label="Dynamic scene playback" style="display: none">
+            <button id="dynamic-play" type="button" aria-label="Pause animation">Pause</button>
+            <input id="dynamic-time" type="range" min="0" max="1" step="0.001" value="0" aria-label="Scene time" />
+            <span id="dynamic-time-label">0.000</span>
+        </div>
         `,
     );
 }
@@ -1470,14 +1926,98 @@ async function main() {
 
     showProgress(0);
     const params = new URLSearchParams(location.search);
+    const viewerConfig = window.FLUX_GS_CONFIG || {};
+    const clampSceneTime = (value) => Math.max(0, Math.min(1, value));
+    const hasConfiguredInitialDynamicTime =
+        params.has("time") ||
+        Object.prototype.hasOwnProperty.call(viewerConfig, "dynamicTime");
+    const configuredSceneTime = Number(
+        params.get("time") ?? viewerConfig?.dynamicTime ?? 0,
+    );
+    const initialDynamicTime = clampSceneTime(
+        Number.isFinite(configuredSceneTime) ? configuredSceneTime : 0,
+    );
+    let hasViewHash = false;
     try {
         viewMatrix = JSON.parse(decodeURIComponent(location.hash.slice(1)));
         carousel = false;
+        hasViewHash = true;
     } catch (err) { }
-    const viewerConfig = window.FLUX_GS_CONFIG || {};
+    const configuredLoopSeconds = Number(
+        params.get("dynamicLoopSeconds") ?? viewerConfig.dynamicLoopSeconds ?? 5,
+    );
+    const dynamicLoopSeconds = Number.isFinite(configuredLoopSeconds) && configuredLoopSeconds > 0
+        ? configuredLoopSeconds
+        : 5;
+    const configuredSortFps = Number(viewerConfig.dynamicSortFps ?? 30);
+    const dynamicSortInterval = 1000 / (
+        Number.isFinite(configuredSortFps) && configuredSortFps > 0
+            ? configuredSortFps
+            : 30
+    );
+    const dynamicAutoplayParam = params.get("dynamicAutoplay");
+    const initialDynamicPlayback = dynamicAutoplayParam === null
+        ? viewerConfig.dynamicAutoplay !== false
+        : !["0", "false", "off"].includes(dynamicAutoplayParam.toLowerCase());
     const modelBaseUrl =
         viewerConfig.modelBaseUrl ||
-        "https://huggingface.co/datasets/mobile-gs2/mobile-gs2/resolve/main/";
+        "https://huggingface.co/datasets/mobile-gs2/mobile-gs2-dynamic/resolve/main/";
+    const configuredCameraUrl = params.get("cameraUrl") ?? viewerConfig.cameraUrl;
+    const isCameraList = (candidate) =>
+        Array.isArray(candidate) && candidate.length > 0 && candidate.every((entry) =>
+            entry && Array.isArray(entry.position) && entry.position.length === 3 &&
+            Array.isArray(entry.rotation) && entry.rotation.length === 3 &&
+            Number.isFinite(Number(entry.width)) && Number(entry.width) > 0 &&
+            Number.isFinite(Number(entry.height)) && Number(entry.height) > 0 &&
+            Number.isFinite(Number(entry.fx)) && Number.isFinite(Number(entry.fy)),
+        );
+    const inferCameraTimes = (cameraList) => {
+        if (cameraList.some((entry) => Number.isFinite(Number(entry.time)))) {
+            return cameraList;
+        }
+
+        const frameNumbers = cameraList.map((entry) => {
+            const match = String(entry.img_name ?? "").match(/(\d+)(?!.*\d)/);
+            return match ? Number(match[1]) : Number.NaN;
+        });
+        const validFrameNumbers = frameNumbers.filter(Number.isFinite);
+        if (validFrameNumbers.length === 0) return cameraList;
+
+        const minFrame = Math.min(...validFrameNumbers);
+        const maxFrame = Math.max(...validFrameNumbers);
+        const frameSpan = maxFrame - minFrame;
+        return cameraList.map((entry, index) => {
+            const frameNumber = frameNumbers[index];
+            if (!Number.isFinite(frameNumber)) return entry;
+            return {
+                ...entry,
+                time: frameSpan > 0 ? (frameNumber - minFrame) / frameSpan : 0,
+            };
+        });
+    };
+
+    // A model's learned scales are calibrated in its source cameras' pixel
+    // space.  Scene pages may supply their matching camera export instead of
+    // inheriting the hard-coded demonstration cameras.
+    if (configuredCameraUrl) {
+        const cameraResponse = await fetch(new URL(configuredCameraUrl, location.href), {
+            mode: "cors",
+            credentials: "omit",
+        });
+        if (!cameraResponse.ok) {
+            throw new Error(`${cameraResponse.status} Unable to load camera data`);
+        }
+        const configuredCameras = await cameraResponse.json();
+        if (!isCameraList(configuredCameras)) {
+            throw new Error("Camera data is not a valid Mobile-GS2 camera list.");
+        }
+        cameras = inferCameraTimes(configuredCameras);
+        camera = cameras[0];
+        if (!hasViewHash) {
+            defaultViewMatrix = getViewMatrix(camera);
+            viewMatrix = defaultViewMatrix;
+        }
+    }
     const defaultModel = viewerConfig.defaultModel || "garden.json";
     const url = new URL(
         params.get("url") || defaultModel,
@@ -1566,7 +2106,9 @@ async function main() {
     const u_viewport = gl.getUniformLocation(program, "viewport");
     const u_focal = gl.getUniformLocation(program, "focal");
     const u_view = gl.getUniformLocation(program, "view");
-    const u_camPos = gl.getUniformLocation(program, "camPos"); 
+    const u_camPos = gl.getUniformLocation(program, "camPos");
+    const u_dynamicTime = gl.getUniformLocation(program, "u_time");
+    const u_dynamicEnabled = gl.getUniformLocation(program, "u_dynamic_enabled");
 
     // positions
     const triangleVertices = new Float32Array([-2, -2, 2, -2, 2, 2, -2, 2]);
@@ -1598,6 +2140,29 @@ async function main() {
     var u_shTextureLocation = gl.getUniformLocation(program, "u_sh_texture");
     gl.uniform1i(u_shTextureLocation, 1);
 
+    const dynamicTexture = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, dynamicTexture);
+    gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA32F,
+        1,
+        1,
+        0,
+        gl.RGBA,
+        gl.FLOAT,
+        new Float32Array([0, 0, 0, 0]),
+    );
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const u_dynamicTextureLocation = gl.getUniformLocation(program, "u_dynamic_texture");
+    gl.uniform1i(u_dynamicTextureLocation, 2);
+    gl.uniform1f(u_dynamicTime, initialDynamicTime);
+    gl.uniform1i(u_dynamicEnabled, 0);
+
     const indexBuffer = gl.createBuffer();
     const a_index = gl.getAttribLocation(program, "index");
     gl.enableVertexAttribArray(a_index);
@@ -1606,29 +2171,142 @@ async function main() {
     gl.vertexAttribDivisor(a_index, 1);
 
     const resize = () => {
-        gl.uniform2fv(u_focal, new Float32Array([camera.fx, camera.fy]));
+        const renderWidth = Math.max(1, Math.round(innerWidth / downsample));
+        const renderHeight = Math.max(1, Math.round(innerHeight / downsample));
+        gl.canvas.width = renderWidth;
+        gl.canvas.height = renderHeight;
+        gl.viewport(0, 0, renderWidth, renderHeight);
+
+        // Mobile-GS2 derives rasterizer focal lengths from the source camera
+        // intrinsics and the current render target:
+        // focal_x = renderWidth * camera.fx / camera.width (and likewise y).
+        // Using raw fx/fy here only happens to work when the browser and
+        // training image have identical dimensions.
+        const focalX = renderWidth * Number(camera.fx) / Number(camera.width);
+        const focalY = renderHeight * Number(camera.fy) / Number(camera.height);
+        gl.uniform2fv(u_focal, new Float32Array([focalX, focalY]));
+        gl.uniform2fv(u_viewport, new Float32Array([renderWidth, renderHeight]));
 
         projectionMatrix = getProjectionMatrix(
-            camera.fx,
-            camera.fy,
-            innerWidth,
-            innerHeight,
+            focalX,
+            focalY,
+            renderWidth,
+            renderHeight,
         );
-
-        gl.uniform2fv(u_viewport, new Float32Array([innerWidth, innerHeight]));
-
-        gl.canvas.width = Math.round(innerWidth / downsample);
-        gl.canvas.height = Math.round(innerHeight / downsample);
-        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
     };
 
     window.addEventListener("resize", resize);
     resize();
 
+    const dynamicControls = document.getElementById("dynamic-controls");
+    const dynamicPlayButton = document.getElementById("dynamic-play");
+    const dynamicTimeInput = document.getElementById("dynamic-time");
+    const dynamicTimeLabel = document.getElementById("dynamic-time-label");
+    let dynamicScene = false;
+    let dynamicTime = initialDynamicTime;
+    let dynamicPlayback = initialDynamicPlayback;
+    let lastDynamicAnimationAt = null;
+    let lastDynamicSortAt = -Infinity;
+    let dynamicRequestSequence = 0;
+    let activeDynamicRequestId = null;
+    let queuedDynamicTime = null;
+
+    const updateDynamicControls = () => {
+        if (dynamicControls) dynamicControls.style.display = dynamicScene ? "flex" : "none";
+        if (dynamicPlayButton) {
+            dynamicPlayButton.textContent = dynamicPlayback ? "Pause" : "Play";
+            dynamicPlayButton.setAttribute(
+                "aria-label",
+                dynamicPlayback ? "Pause animation" : "Play animation",
+            );
+        }
+        if (dynamicTimeInput) dynamicTimeInput.value = dynamicTime.toFixed(3);
+        if (dynamicTimeLabel) dynamicTimeLabel.textContent = dynamicTime.toFixed(3);
+    };
+
+    const dispatchDynamicFrame = (time, now = performance.now()) => {
+        const requestId = ++dynamicRequestSequence;
+        activeDynamicRequestId = requestId;
+        worker.postMessage({
+            time,
+            dynamicRequestId: requestId,
+        });
+        lastDynamicSortAt = now;
+    };
+
+    const requestDynamicSort = (now, force = false) => {
+        if (!dynamicScene || (!force && now - lastDynamicSortAt < dynamicSortInterval)) return;
+        if (activeDynamicRequestId !== null) {
+            // Keep only the newest requested time. The SH network is expensive,
+            // so queuing every animation-frame timestamp would make rendering
+            // drift farther and farther behind playback.
+            queuedDynamicTime = dynamicTime;
+            lastDynamicSortAt = now;
+            return;
+        }
+        dispatchDynamicFrame(dynamicTime, now);
+    };
+
+    const setDynamicTime = (time, now = performance.now(), forceSort = false) => {
+        dynamicTime = clampSceneTime(time);
+        updateDynamicControls();
+        requestDynamicSort(now, forceSort);
+    };
+
+    const setDynamicPlayback = (playing) => {
+        dynamicPlayback = playing;
+        lastDynamicAnimationAt = null;
+        updateDynamicControls();
+    };
+
+    const syncDynamicTimeToCamera = (nextCamera, pausePlayback = true) => {
+        const cameraTime = Number(nextCamera && nextCamera.time);
+        if (dynamicScene && Number.isFinite(cameraTime)) {
+            if (pausePlayback) setDynamicPlayback(false);
+            setDynamicTime(cameraTime, performance.now(), true);
+            return true;
+        }
+        return false;
+    };
+
+    dynamicPlayButton?.addEventListener("click", () => {
+        setDynamicPlayback(!dynamicPlayback);
+    });
+    dynamicTimeInput?.addEventListener("input", () => {
+        setDynamicPlayback(false);
+        setDynamicTime(Number(dynamicTimeInput.value), performance.now(), true);
+    });
+    updateDynamicControls();
+
+    const uploadShTexture = ({ texdata_sh, texwidth_sh, texheight_sh }) => {
+        console.log("Received SH texture data:", texwidth_sh, "x", texheight_sh);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, shTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA32F,
+            texwidth_sh,
+            texheight_sh,
+            0,
+            gl.RGBA,
+            gl.FLOAT,
+            texdata_sh,
+        );
+        console.log("SH texture updated successfully");
+    };
+
     worker.onmessage = (e) => {
-        if (e.data.progress) {
+        if (e.data.error) {
+            hideProgress();
+            document.getElementById("spinner").style.display = "none";
+            document.getElementById("message").innerText = e.data.error;
+        } else if (e.data.progress) {
             showProgress(
                 e.data.progress.percent,
                 progressText[e.data.progress.phase] || progressText.prepare,
@@ -1678,22 +2356,72 @@ async function main() {
             );
             console.log("Main texture updated successfully");
         } else if (e.data.texdata_sh) {
-            showProgress(99, progressText.prepare);
-            const { texdata_sh, texwidth_sh, texheight_sh } = e.data;
-            console.log("Received SH texture data:", texwidth_sh, "x", texheight_sh);
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, shTexture);
+            if (progressVisible) showProgress(99, progressText.prepare);
+            uploadShTexture(e.data);
+        } else if (e.data.texdata_dynamic) {
+            const { texdata_dynamic, texwidth_dynamic, texheight_dynamic } = e.data;
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, dynamicTexture);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, texwidth_sh, texheight_sh, 0, gl.RGBA, gl.FLOAT, texdata_sh);
-            console.log("SH texture updated successfully");
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA32F,
+                texwidth_dynamic,
+                texheight_dynamic,
+                0,
+                gl.RGBA,
+                gl.FLOAT,
+                texdata_dynamic,
+            );
+        } else if (e.data.dynamic) {
+            dynamicScene = Boolean(e.data.dynamic.enabled);
+            lastDynamicAnimationAt = null;
+            lastDynamicSortAt = -Infinity;
+            activeDynamicRequestId = null;
+            queuedDynamicTime = null;
+            if (dynamicScene && Number.isFinite(e.data.dynamic.time)) {
+                // The initial SH texture and sort were generated at the
+                // worker's decode time. Keep the shader on that same time
+                // until the first requested dynamic frame is acknowledged.
+                gl.uniform1f(u_dynamicTime, e.data.dynamic.time);
+            }
+            gl.uniform1i(u_dynamicEnabled, dynamicScene ? 1 : 0);
+            const syncedInitialCameraTime =
+                dynamicScene &&
+                !hasConfiguredInitialDynamicTime &&
+                syncDynamicTimeToCamera(camera, false);
+            if (!syncedInitialCameraTime) {
+                setDynamicTime(dynamicTime, performance.now(), true);
+            }
+            updateDynamicControls();
         } else if (e.data.depthIndex) {
             const { depthIndex, viewProj } = e.data;
+            const isDynamicFrame =
+                Number.isInteger(e.data.dynamicRequestId) &&
+                e.data.dynamicRequestId === activeDynamicRequestId;
+            if (isDynamicFrame && e.data.dynamicSh) {
+                uploadShTexture(e.data.dynamicSh);
+            }
             gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
             gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             vertexCount = e.data.vertexCount;
+            if (isDynamicFrame) {
+                // Commit position, temporal opacity, SH coefficients, and the
+                // matching depth order together in this single main-thread task.
+                gl.uniform1f(u_dynamicTime, e.data.dynamicTime);
+                activeDynamicRequestId = null;
+
+                const nextTime = queuedDynamicTime;
+                queuedDynamicTime = null;
+                if (Number.isFinite(nextTime) &&
+                    Math.abs(nextTime - e.data.dynamicTime) > 1e-6) {
+                    dispatchDynamicFrame(nextTime);
+                }
+            }
             hideProgress();
         }
     };
@@ -1713,6 +2441,8 @@ async function main() {
                 currentCameraIndex = newIndex;
                 camera = cameras[currentCameraIndex];
                 viewMatrix = getViewMatrix(camera);
+                syncDynamicTimeToCamera(camera);
+                resize();
             }
         }
         
@@ -1721,12 +2451,16 @@ async function main() {
             currentCameraIndex = (currentCameraIndex + cameras.length - 1) % cameras.length;
             camera = cameras[currentCameraIndex]; // Now updating global reference
             viewMatrix = getViewMatrix(camera);
+            syncDynamicTimeToCamera(camera);
+            resize();
         }
         
         if (["+", "="].includes(e.key)) {
             currentCameraIndex = (currentCameraIndex + 1) % cameras.length;
             camera = cameras[currentCameraIndex]; // Now updating global reference
             viewMatrix = getViewMatrix(camera);
+            syncDynamicTimeToCamera(camera);
+            resize();
         }
         camid.innerText = "cam  " + currentCameraIndex;
         if (e.code == "KeyV") {
@@ -1970,6 +2704,16 @@ async function main() {
     let leftGamepadTrigger, rightGamepadTrigger;
 
     const frame = (now) => {
+        if (dynamicScene && dynamicPlayback) {
+            if (lastDynamicAnimationAt !== null) {
+                const nextTime = (dynamicTime + (now - lastDynamicAnimationAt) / (dynamicLoopSeconds * 1000)) % 1;
+                setDynamicTime(nextTime, now);
+            }
+            lastDynamicAnimationAt = now;
+        } else {
+            lastDynamicAnimationAt = null;
+        }
+
         let inv = invert4(viewMatrix);
         let shiftKey =
             activeKeys.includes("Shift") ||
@@ -2064,6 +2808,8 @@ async function main() {
                 camera =
                     cameras[(cameras.indexOf(camera) + 1) % cameras.length];
                 inv = invert4(getViewMatrix(camera));
+                syncDynamicTimeToCamera(camera);
+                resize();
                 carousel = false;
             }
             if (gamepad.buttons[5].pressed && !rightGamepadTrigger) {
@@ -2073,6 +2819,8 @@ async function main() {
                     cameras.length
                     ];
                 inv = invert4(getViewMatrix(camera));
+                syncDynamicTimeToCamera(camera);
+                resize();
                 carousel = false;
             }
             leftGamepadTrigger = gamepad.buttons[4].pressed;
@@ -2162,6 +2910,8 @@ async function main() {
             gl.bindTexture(gl.TEXTURE_2D, mainTexture);
             gl.activeTexture(gl.TEXTURE1);
             gl.bindTexture(gl.TEXTURE_2D, shTexture);
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_2D, dynamicTexture);
 
             const error = gl.getError();
             if (error !== gl.NO_ERROR) {
@@ -2187,7 +2937,7 @@ async function main() {
         requestAnimationFrame(frame);
     };
 
-    frame();
+    frame(performance.now());
 
     const isPly = (splatData) =>
         splatData[0] == 112 &&
@@ -2195,46 +2945,63 @@ async function main() {
         splatData[2] == 121 &&
         splatData[3] == 10;
 
+    const tryLoadCameraJson = (data) => {
+        const prefix = new TextDecoder().decode(data.subarray(0, Math.min(data.length, 256))).trimStart();
+        if (!prefix.startsWith("[")) return false;
+
+        try {
+            const loadedCameras = JSON.parse(new TextDecoder().decode(data));
+            if (!Array.isArray(loadedCameras) || !loadedCameras[0] ||
+                !Array.isArray(loadedCameras[0].position) || !Array.isArray(loadedCameras[0].rotation)) {
+                return false;
+            }
+            cameras = inferCameraTimes(loadedCameras);
+            camera = cameras[0];
+            viewMatrix = getViewMatrix(camera);
+            syncDynamicTimeToCamera(camera);
+            resize();
+            console.log("Loaded Cameras");
+            return true;
+        } catch (error) {
+            return false;
+        }
+    };
+
+    const loadModelData = (data) => {
+        stopLoading = true;
+        splatData = data;
+        console.log("Loaded File length:", splatData.length);
+        showProgress(50, progressText.decompose);
+
+        if (isPly(splatData)) {
+            worker.postMessage({ ply: splatData.buffer, save: true });
+        } else {
+            worker.postMessage({ mobilegs: splatData.buffer, save: true });
+        }
+    };
+
     const selectFile = (file) => {
         const fr = new FileReader();
-
-        if (/\.json$/i.test(file.name)) {
-            fr.onload = () => {
-                cameras = JSON.parse(fr.result);
-                camera = cameras[0]; // Ensure global camera updates
-                viewMatrix = getViewMatrix(camera);
-                projectionMatrix = getProjectionMatrix(
-                    camera.fx / downsample,
-                    camera.fy / downsample,
-                    canvas.width,
-                    canvas.height,
-                );
-                gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
-                console.log("Loaded Cameras");
-            };
-            fr.readAsText(file);
-        } else {
+        const mayBeCameraJson = /\.json$/i.test(file.name);
+        if (!mayBeCameraJson) {
             stopLoading = true;
             showProgress(0, progressText.load);
-            fr.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    showProgress((event.loaded / event.total) * 50, progressText.load);
-                }
-            };
-            fr.onload = () => {
-                splatData = new Uint8Array(fr.result);
-                console.log("Loaded File length:", splatData.length);
-                showProgress(50, progressText.decompose);
-
-                if (isPly(splatData)) {
-                    worker.postMessage({ ply: splatData.buffer, save: true });
-                } else {
-                    // Send to your custom mobile-gs decoder pipeline
-                    worker.postMessage({ mobilegs: splatData.buffer, save: true });
-                }
-            };
-            fr.readAsArrayBuffer(file);
         }
+        fr.onprogress = (event) => {
+            if (!mayBeCameraJson && event.lengthComputable) {
+                showProgress((event.loaded / event.total) * 50, progressText.load);
+            }
+        };
+        fr.onload = () => {
+            const data = new Uint8Array(fr.result);
+            // Mobile-GS2 model blobs use a binary JSON header despite the
+            // conventional .json extension.  Only treat genuine camera arrays
+            // as camera data; otherwise pass the file to the model decoder.
+            if (mayBeCameraJson && tryLoadCameraJson(data)) return;
+            if (mayBeCameraJson) showProgress(0, progressText.load);
+            loadModelData(data);
+        };
+        fr.readAsArrayBuffer(file);
     };
 
     window.addEventListener("hashchange", (e) => {

@@ -166,6 +166,40 @@ p {
     right: 10px;
 }
 
+#dynamic-controls {
+    position: absolute;
+    z-index: 999;
+    right: 12px;
+    bottom: 34px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.58);
+    font-size: 12px;
+}
+
+#dynamic-controls button {
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 4px;
+    padding: 3px 7px;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.12);
+    font: inherit;
+    cursor: pointer;
+}
+
+#dynamic-controls input {
+    width: min(180px, 42vw);
+}
+
+#dynamic-time-label {
+    min-width: 34px;
+    font-variant-numeric: tabular-nums;
+}
+
 #canvas {
     display: block;
     position: absolute;
