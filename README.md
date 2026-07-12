@@ -48,3 +48,4 @@ https://github.com/antimatter15/splat/assets/30054/878d5d34-e0a7-4336-85df-111ff
 ## 👍 **Acknowledgement**
 This work is built on many amazing research works and open-source projects, thanks a lot to all the authors for sharing!
 * [splat](https://github.com/antimatter15/splat)
+# mobile-gs2-project
