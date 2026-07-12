@@ -172,8 +172,11 @@ p {
     right: 12px;
     bottom: 34px;
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     align-items: center;
     gap: 8px;
+    max-width: calc(100vw - 24px);
     padding: 7px 9px;
     border: 1px solid rgba(255, 255, 255, 0.35);
     border-radius: 6px;
@@ -191,12 +194,31 @@ p {
     cursor: pointer;
 }
 
-#dynamic-controls input {
+#dynamic-time {
     width: min(180px, 42vw);
 }
 
 #dynamic-time-label {
     min-width: 34px;
+    font-variant-numeric: tabular-nums;
+}
+
+#dynamic-loop-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    white-space: nowrap;
+}
+
+#dynamic-loop-seconds {
+    width: 48px;
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 3px;
+    padding: 2px 3px;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.12);
+    font: inherit;
     font-variant-numeric: tabular-nums;
 }
 

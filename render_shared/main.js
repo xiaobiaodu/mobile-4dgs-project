@@ -1880,6 +1880,11 @@ function ensureViewerDom() {
             <button id="dynamic-play" type="button" aria-label="Pause animation">Pause</button>
             <input id="dynamic-time" type="range" min="0" max="1" step="0.001" value="0" aria-label="Scene time" />
             <span id="dynamic-time-label">0.000</span>
+            <label id="dynamic-loop-label">
+                Loop
+                <input id="dynamic-loop-seconds" type="number" min="0.1" step="0.1" value="5" aria-label="Loop duration in seconds" />
+                s
+            </label>
         </div>
         `,
     );
@@ -1946,7 +1951,7 @@ async function main() {
     const configuredLoopSeconds = Number(
         params.get("dynamicLoopSeconds") ?? viewerConfig.dynamicLoopSeconds ?? 5,
     );
-    const dynamicLoopSeconds = Number.isFinite(configuredLoopSeconds) && configuredLoopSeconds > 0
+    let dynamicLoopSeconds = Number.isFinite(configuredLoopSeconds) && configuredLoopSeconds >= 0.1
         ? configuredLoopSeconds
         : 5;
     const configuredSortFps = Number(viewerConfig.dynamicSortFps ?? 30);
@@ -2203,8 +2208,10 @@ async function main() {
     const dynamicPlayButton = document.getElementById("dynamic-play");
     const dynamicTimeInput = document.getElementById("dynamic-time");
     const dynamicTimeLabel = document.getElementById("dynamic-time-label");
+    const dynamicLoopInput = document.getElementById("dynamic-loop-seconds");
     let dynamicScene = false;
     let dynamicTime = initialDynamicTime;
+    let renderedDynamicTime = initialDynamicTime;
     let dynamicPlayback = initialDynamicPlayback;
     let lastDynamicAnimationAt = null;
     let lastDynamicSortAt = -Infinity;
@@ -2221,8 +2228,11 @@ async function main() {
                 dynamicPlayback ? "Pause animation" : "Play animation",
             );
         }
-        if (dynamicTimeInput) dynamicTimeInput.value = dynamicTime.toFixed(3);
-        if (dynamicTimeLabel) dynamicTimeLabel.textContent = dynamicTime.toFixed(3);
+        if (dynamicTimeInput) dynamicTimeInput.value = renderedDynamicTime.toFixed(3);
+        if (dynamicTimeLabel) dynamicTimeLabel.textContent = renderedDynamicTime.toFixed(3);
+        if (dynamicLoopInput && document.activeElement !== dynamicLoopInput) {
+            dynamicLoopInput.value = dynamicLoopSeconds.toFixed(1);
+        }
     };
 
     const dispatchDynamicFrame = (time, now = performance.now()) => {
@@ -2250,7 +2260,6 @@ async function main() {
 
     const setDynamicTime = (time, now = performance.now(), forceSort = false) => {
         dynamicTime = clampSceneTime(time);
-        updateDynamicControls();
         requestDynamicSort(now, forceSort);
     };
 
@@ -2274,8 +2283,17 @@ async function main() {
         setDynamicPlayback(!dynamicPlayback);
     });
     dynamicTimeInput?.addEventListener("input", () => {
+        const requestedTime = Number(dynamicTimeInput.value);
         setDynamicPlayback(false);
-        setDynamicTime(Number(dynamicTimeInput.value), performance.now(), true);
+        setDynamicTime(requestedTime, performance.now(), true);
+    });
+    dynamicLoopInput?.addEventListener("change", () => {
+        const requestedSeconds = Number(dynamicLoopInput.value);
+        if (Number.isFinite(requestedSeconds) && requestedSeconds >= 0.1) {
+            dynamicLoopSeconds = requestedSeconds;
+            lastDynamicAnimationAt = performance.now();
+        }
+        updateDynamicControls();
     });
     updateDynamicControls();
 
@@ -2387,7 +2405,8 @@ async function main() {
                 // The initial SH texture and sort were generated at the
                 // worker's decode time. Keep the shader on that same time
                 // until the first requested dynamic frame is acknowledged.
-                gl.uniform1f(u_dynamicTime, e.data.dynamic.time);
+                renderedDynamicTime = clampSceneTime(e.data.dynamic.time);
+                gl.uniform1f(u_dynamicTime, renderedDynamicTime);
             }
             gl.uniform1i(u_dynamicEnabled, dynamicScene ? 1 : 0);
             const syncedInitialCameraTime =
@@ -2412,8 +2431,10 @@ async function main() {
             if (isDynamicFrame) {
                 // Commit position, temporal opacity, SH coefficients, and the
                 // matching depth order together in this single main-thread task.
-                gl.uniform1f(u_dynamicTime, e.data.dynamicTime);
+                renderedDynamicTime = clampSceneTime(e.data.dynamicTime);
+                gl.uniform1f(u_dynamicTime, renderedDynamicTime);
                 activeDynamicRequestId = null;
+                updateDynamicControls();
 
                 const nextTime = queuedDynamicTime;
                 queuedDynamicTime = null;
@@ -2687,8 +2708,8 @@ async function main() {
     let jumpDelta = 0;
     let vertexCount = 0;
 
-    let lastFrame = 0;
-    let avgFps = 0;
+    let fpsWindowStart = null;
+    let fpsFrameCount = 0;
     let start = 0;
 
     window.addEventListener("gamepadconnected", (e) => {
@@ -2898,9 +2919,6 @@ async function main() {
         const viewProj = multiply4(projectionMatrix, actualViewMatrix);
         worker.postMessage({ view: viewProj });
 
-        const currentFps = 1000 / (now - lastFrame) || 0;
-        avgFps = avgFps * 0.9 + currentFps * 0.1;
-
         if (vertexCount > 0) {
             document.getElementById("spinner").style.display = "none";
             gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
@@ -2929,11 +2947,24 @@ async function main() {
             document.getElementById("spinner").style.display = "";
             start = Date.now() + 2000;
         }
-        fps.innerText = Math.round(avgFps) + " fps";
+        if (fpsWindowStart === null || now - fpsWindowStart > 2000) {
+            // Initialize without counting a zero-duration first frame, and
+            // discard long gaps caused by a suspended/background browser tab.
+            fpsWindowStart = now;
+            fpsFrameCount = 0;
+        } else {
+            fpsFrameCount++;
+            const fpsElapsed = now - fpsWindowStart;
+            if (fpsElapsed >= 1000) {
+                const measuredFps = fpsFrameCount * 1000 / fpsElapsed;
+                fps.innerText = Math.round(measuredFps) + " fps";
+                fpsWindowStart = now;
+                fpsFrameCount = 0;
+            }
+        }
         if (isNaN(currentCameraIndex)) {
             camid.innerText = "";
         }
-        lastFrame = now;
         requestAnimationFrame(frame);
     };
 
