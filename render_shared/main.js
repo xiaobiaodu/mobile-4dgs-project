@@ -1962,8 +1962,11 @@ async function main() {
                 ? configuredSortFps
                 : 30
         );
-    const smoothDynamicPlayback = viewerConfig.smoothDynamicPlayback === true;
-    const dynamicShDuringPlayback = viewerConfig.dynamicShDuringPlayback !== false;
+    // Dynamic motion is cheap in the vertex shader, so keep it synchronized
+    // with the display by default. The per-Gaussian appearance MLP remains an
+    // opt-in playback cost and is still evaluated for paused/scrubbed frames.
+    const smoothDynamicPlayback = viewerConfig.smoothDynamicPlayback !== false;
+    const dynamicShDuringPlayback = viewerConfig.dynamicShDuringPlayback === true;
     const debugWebGL = viewerConfig.debugWebGL === true;
     const dynamicAutoplayParam = params.get("dynamicAutoplay");
     const initialDynamicPlayback = dynamicAutoplayParam === null

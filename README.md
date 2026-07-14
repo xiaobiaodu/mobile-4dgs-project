@@ -32,9 +32,10 @@ optional `time` field, selecting that camera pauses playback at its frame time.
 scene page. `cameraUrl` should point to the Mobile-GS2 `cameras.json` that was
 exported with that model; its intrinsics are rescaled to the actual WebGL
 framebuffer before calculating Gaussian footprints.
-For expensive dynamic scenes, `smoothDynamicPlayback: true` advances GPU motion
-at display refresh rate, while `dynamicShDuringPlayback: false` defers the
-per-Gaussian appearance MLP until playback is paused or scrubbed.
+Dynamic scenes advance GPU motion at display refresh rate by default. Set
+`smoothDynamicPlayback: false` to restore worker-synchronized motion, or
+`dynamicShDuringPlayback: true` to run the expensive per-Gaussian appearance
+MLP continuously instead of deferring it until playback is paused or scrubbed.
 The drag-and-drop loader distinguishes a camera JSON array from a Mobile-GS2
 binary `.json` model, so locally exported dynamic `comp.json` files load as
 models rather than being mistaken for camera metadata.
