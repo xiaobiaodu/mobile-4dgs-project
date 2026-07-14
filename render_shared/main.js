@@ -737,7 +737,6 @@ function contractToUnisphereInPlace(x, y, z, out) {
             lastVertexCount = vertexCount;
         }
 
-        console.time("sort");
         let maxDepth = -Infinity;
         let minDepth = Infinity;
         let sizeList = new Int32Array(vertexCount);
@@ -774,8 +773,6 @@ function contractToUnisphereInPlace(x, y, z, out) {
         depthIndex = new Uint32Array(vertexCount);
         for (let i = 0; i < vertexCount; i++)
             depthIndex[starts0[sizeList[i]]++] = i;
-
-        console.timeEnd("sort");
 
         lastProj = viewProj;
         lastDynamicSortTime = hasDynamicMotion ? dynamicTime : Number.NaN;
@@ -1614,7 +1611,8 @@ function contractToUnisphere(x, y, z) {
                 const nextTime = e.data.time;
                 const timeChanged = Math.abs(dynamicTime - nextTime) > 1e-6;
                 dynamicTime = nextTime;
-                const shPayload = updateDynamicShBuffer(dynamicTime)
+                const shouldUpdateSh = e.data.updateDynamicSh !== false;
+                const shPayload = shouldUpdateSh && updateDynamicShBuffer(dynamicTime)
                     ? createShTexturePayload()
                     : null;
                 pendingDynamicFrame = {
@@ -1955,11 +1953,18 @@ async function main() {
         ? configuredLoopSeconds
         : 5;
     const configuredSortFps = Number(viewerConfig.dynamicSortFps ?? 30);
-    const dynamicSortInterval = 1000 / (
-        Number.isFinite(configuredSortFps) && configuredSortFps > 0
-            ? configuredSortFps
-            : 30
-    );
+    // A value of 0 means uncapped: request the next update as soon as the
+    // worker is available. Invalid values retain the conservative default.
+    const dynamicSortInterval = configuredSortFps === 0
+        ? 0
+        : 1000 / (
+            Number.isFinite(configuredSortFps) && configuredSortFps > 0
+                ? configuredSortFps
+                : 30
+        );
+    const smoothDynamicPlayback = viewerConfig.smoothDynamicPlayback === true;
+    const dynamicShDuringPlayback = viewerConfig.dynamicShDuringPlayback !== false;
+    const debugWebGL = viewerConfig.debugWebGL === true;
     const dynamicAutoplayParam = params.get("dynamicAutoplay");
     const initialDynamicPlayback = dynamicAutoplayParam === null
         ? viewerConfig.dynamicAutoplay !== false
@@ -2218,8 +2223,10 @@ async function main() {
     let dynamicRequestSequence = 0;
     let activeDynamicRequestId = null;
     let queuedDynamicTime = null;
+    let discardActiveDynamicFrame = false;
+    let lastPlaybackControlsAt = -Infinity;
 
-    const updateDynamicControls = () => {
+    const updateDynamicControls = (displayTime = renderedDynamicTime) => {
         if (dynamicControls) dynamicControls.style.display = dynamicScene ? "flex" : "none";
         if (dynamicPlayButton) {
             dynamicPlayButton.textContent = dynamicPlayback ? "Pause" : "Play";
@@ -2228,8 +2235,8 @@ async function main() {
                 dynamicPlayback ? "Pause animation" : "Play animation",
             );
         }
-        if (dynamicTimeInput) dynamicTimeInput.value = renderedDynamicTime.toFixed(3);
-        if (dynamicTimeLabel) dynamicTimeLabel.textContent = renderedDynamicTime.toFixed(3);
+        if (dynamicTimeInput) dynamicTimeInput.value = displayTime.toFixed(3);
+        if (dynamicTimeLabel) dynamicTimeLabel.textContent = displayTime.toFixed(3);
         if (dynamicLoopInput && document.activeElement !== dynamicLoopInput) {
             dynamicLoopInput.value = dynamicLoopSeconds.toFixed(1);
         }
@@ -2241,6 +2248,7 @@ async function main() {
         worker.postMessage({
             time,
             dynamicRequestId: requestId,
+            updateDynamicSh: !dynamicPlayback || dynamicShDuringPlayback,
         });
         lastDynamicSortAt = now;
     };
@@ -2269,23 +2277,46 @@ async function main() {
         updateDynamicControls();
     };
 
+    const pauseDynamicPlaybackAt = (time) => {
+        dynamicPlayback = false;
+        lastDynamicAnimationAt = null;
+        dynamicTime = clampSceneTime(time);
+
+        // A worker frame can finish well after Pause is pressed. Invalidate
+        // that response, retain only the newest paused/scrubbed time, and wait
+        // for the in-flight work before requesting another expensive frame.
+        if (activeDynamicRequestId !== null) {
+            discardActiveDynamicFrame = true;
+            queuedDynamicTime = dynamicTime;
+        } else {
+            requestDynamicSort(performance.now(), true);
+        }
+        updateDynamicControls(dynamicTime);
+    };
+
     const syncDynamicTimeToCamera = (nextCamera, pausePlayback = true) => {
         const cameraTime = Number(nextCamera && nextCamera.time);
         if (dynamicScene && Number.isFinite(cameraTime)) {
-            if (pausePlayback) setDynamicPlayback(false);
-            setDynamicTime(cameraTime, performance.now(), true);
+            if (pausePlayback) {
+                pauseDynamicPlaybackAt(cameraTime);
+            } else {
+                setDynamicTime(cameraTime, performance.now(), true);
+            }
             return true;
         }
         return false;
     };
 
     dynamicPlayButton?.addEventListener("click", () => {
-        setDynamicPlayback(!dynamicPlayback);
+        if (dynamicPlayback) {
+            pauseDynamicPlaybackAt(renderedDynamicTime);
+        } else {
+            setDynamicPlayback(true);
+        }
     });
     dynamicTimeInput?.addEventListener("input", () => {
         const requestedTime = Number(dynamicTimeInput.value);
-        setDynamicPlayback(false);
-        setDynamicTime(requestedTime, performance.now(), true);
+        pauseDynamicPlaybackAt(requestedTime);
     });
     dynamicLoopInput?.addEventListener("change", () => {
         const requestedSeconds = Number(dynamicLoopInput.value);
@@ -2294,6 +2325,10 @@ async function main() {
             lastDynamicAnimationAt = performance.now();
         }
         updateDynamicControls();
+    });
+    document.addEventListener("visibilitychange", () => {
+        // Do not count time spent in a suspended/background tab as playback.
+        lastDynamicAnimationAt = null;
     });
     updateDynamicControls();
 
@@ -2401,6 +2436,8 @@ async function main() {
             lastDynamicSortAt = -Infinity;
             activeDynamicRequestId = null;
             queuedDynamicTime = null;
+            discardActiveDynamicFrame = false;
+            lastPlaybackControlsAt = -Infinity;
             if (dynamicScene && Number.isFinite(e.data.dynamic.time)) {
                 // The initial SH texture and sort were generated at the
                 // worker's decode time. Keep the shader on that same time
@@ -2419,20 +2456,41 @@ async function main() {
             updateDynamicControls();
         } else if (e.data.depthIndex) {
             const { depthIndex, viewProj } = e.data;
+            const hasDynamicRequestId = Number.isInteger(e.data.dynamicRequestId);
             const isDynamicFrame =
-                Number.isInteger(e.data.dynamicRequestId) &&
+                hasDynamicRequestId &&
                 e.data.dynamicRequestId === activeDynamicRequestId;
-            if (isDynamicFrame && e.data.dynamicSh) {
+            if (hasDynamicRequestId && !isDynamicFrame) {
+                // This frame was superseded by a pause, scrub, or camera jump.
+                return;
+            }
+            if (isDynamicFrame && discardActiveDynamicFrame) {
+                activeDynamicRequestId = null;
+                discardActiveDynamicFrame = false;
+                const nextTime = queuedDynamicTime;
+                queuedDynamicTime = null;
+                if (Number.isFinite(nextTime) &&
+                    Math.abs(nextTime - renderedDynamicTime) > 1e-6) {
+                    dispatchDynamicFrame(nextTime);
+                }
+                return;
+            }
+            if (isDynamicFrame && e.data.dynamicSh &&
+                (!smoothDynamicPlayback || !dynamicPlayback)) {
                 uploadShTexture(e.data.dynamicSh);
             }
             gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
             gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             vertexCount = e.data.vertexCount;
             if (isDynamicFrame) {
-                // Commit position, temporal opacity, SH coefficients, and the
-                // matching depth order together in this single main-thread task.
-                renderedDynamicTime = clampSceneTime(e.data.dynamicTime);
-                gl.uniform1f(u_dynamicTime, renderedDynamicTime);
+                // The default path commits all dynamic state atomically. A
+                // smooth-playback scene advances motion in the vertex shader
+                // every display frame and treats this as a background depth
+                // correction, so it must not jump back to the worker's time.
+                if (!smoothDynamicPlayback || !dynamicPlayback) {
+                    renderedDynamicTime = clampSceneTime(e.data.dynamicTime);
+                    gl.uniform1f(u_dynamicTime, renderedDynamicTime);
+                }
                 activeDynamicRequestId = null;
                 updateDynamicControls();
 
@@ -2440,7 +2498,13 @@ async function main() {
                 queuedDynamicTime = null;
                 if (Number.isFinite(nextTime) &&
                     Math.abs(nextTime - e.data.dynamicTime) > 1e-6) {
-                    dispatchDynamicFrame(nextTime);
+                    if (smoothDynamicPlayback && dynamicPlayback) {
+                        // Respect dynamicSortFps instead of keeping the worker
+                        // permanently saturated during smooth GPU playback.
+                        requestDynamicSort(performance.now());
+                    } else {
+                        dispatchDynamicFrame(nextTime);
+                    }
                 }
             }
             hideProgress();
@@ -2731,6 +2795,16 @@ async function main() {
                 setDynamicTime(nextTime, now);
             }
             lastDynamicAnimationAt = now;
+            if (smoothDynamicPlayback) {
+                // Position and temporal opacity are evaluated by the vertex
+                // shader, so advance them at the display refresh rate.
+                renderedDynamicTime = dynamicTime;
+                gl.uniform1f(u_dynamicTime, renderedDynamicTime);
+                if (now - lastPlaybackControlsAt >= 100) {
+                    updateDynamicControls();
+                    lastPlaybackControlsAt = now;
+                }
+            }
         } else {
             lastDynamicAnimationAt = null;
         }
@@ -2931,16 +3005,20 @@ async function main() {
             gl.activeTexture(gl.TEXTURE2);
             gl.bindTexture(gl.TEXTURE_2D, dynamicTexture);
 
-            const error = gl.getError();
-            if (error !== gl.NO_ERROR) {
-                console.error("WebGL error before draw:", error);
+            if (debugWebGL) {
+                const error = gl.getError();
+                if (error !== gl.NO_ERROR) {
+                    console.error("WebGL error before draw:", error);
+                }
             }
 
             gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
 
-            const drawError = gl.getError();
-            if (drawError !== gl.NO_ERROR) {
-                console.error("WebGL error after draw:", drawError);
+            if (debugWebGL) {
+                const drawError = gl.getError();
+                if (drawError !== gl.NO_ERROR) {
+                    console.error("WebGL error after draw:", drawError);
+                }
             }
         } else {
             gl.clear(gl.COLOR_BUFFER_BIT);

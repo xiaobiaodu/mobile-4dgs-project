@@ -28,10 +28,13 @@ time, `?dynamicAutoplay=false` to start paused, and
 optional `time` field, selecting that camera pauses playback at its frame time.
 
 `window.FLUX_GS_CONFIG` may also set `dynamicTime`, `dynamicAutoplay`,
-`dynamicLoopSeconds`, `dynamicSortFps` (default `30`), and `cameraUrl` for a
+`dynamicLoopSeconds`, `dynamicSortFps` (default `30`; use `0` for uncapped), and `cameraUrl` for a
 scene page. `cameraUrl` should point to the Mobile-GS2 `cameras.json` that was
 exported with that model; its intrinsics are rescaled to the actual WebGL
 framebuffer before calculating Gaussian footprints.
+For expensive dynamic scenes, `smoothDynamicPlayback: true` advances GPU motion
+at display refresh rate, while `dynamicShDuringPlayback: false` defers the
+per-Gaussian appearance MLP until playback is paused or scrubbed.
 The drag-and-drop loader distinguishes a camera JSON array from a Mobile-GS2
 binary `.json` model, so locally exported dynamic `comp.json` files load as
 models rather than being mistaken for camera metadata.
