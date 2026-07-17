@@ -36,6 +36,8 @@ Dynamic scenes advance GPU motion at display refresh rate by default. Set
 `smoothDynamicPlayback: false` to restore worker-synchronized motion, or
 `dynamicShDuringPlayback: true` to run the expensive per-Gaussian appearance
 MLP continuously instead of deferring it until playback is paused or scrubbed.
+The on-screen FPS counter measures presented animation frames and is therefore
+capped by the browser/display refresh rate.
 The drag-and-drop loader distinguishes a camera JSON array from a Mobile-GS2
 binary `.json` model, so locally exported dynamic `comp.json` files load as
 models rather than being mistaken for camera metadata.
