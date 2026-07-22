@@ -36,6 +36,10 @@ Dynamic scenes advance GPU motion at display refresh rate by default. Set
 `smoothDynamicPlayback: false` to restore worker-synchronized motion, or
 `dynamicShDuringPlayback: true` to run the expensive per-Gaussian appearance
 MLP continuously instead of deferring it until playback is paused or scrubbed.
+For temporally subsampled training data, set `dynamicLoopSeconds` from the
+source sequence rather than the training sample count. For example, the N3DV
+scene pages use `1200 / 30` seconds: their 300 training frames are interpolated
+over the original 1,200-frame, 30 FPS timeline.
 The on-screen FPS counter measures presented animation frames and is therefore
 capped by the browser/display refresh rate.
 The drag-and-drop loader distinguishes a camera JSON array from a Mobile-GS2
