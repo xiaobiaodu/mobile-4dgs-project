@@ -40,8 +40,10 @@ For temporally subsampled training data, set `dynamicLoopSeconds` from the
 source sequence rather than the training sample count. For example, the N3DV
 scene pages use `1200 / 30` seconds: their 300 training frames are interpolated
 over the original 1,200-frame, 30 FPS timeline.
-The on-screen FPS counter measures presented animation frames and is therefore
-capped by the browser/display refresh rate.
+The on-screen rendering-performance counter uses asynchronous WebGL GPU timer
+queries. It reports average GPU render time and its corresponding throughput,
+so it is not capped by the browser/display refresh rate. Browsers without
+`EXT_disjoint_timer_query_webgl2` report that GPU timing is unavailable.
 The drag-and-drop loader distinguishes a camera JSON array from a Mobile-GS2
 binary `.json` model, so locally exported dynamic `comp.json` files load as
 models rather than being mistaken for camera metadata.

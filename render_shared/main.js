@@ -2084,6 +2084,76 @@ async function main() {
         antialias: false,
     });
 
+    // Measure GPU command execution rather than requestAnimationFrame cadence.
+    // Timer-query results arrive asynchronously, so rendering never waits for
+    // the GPU merely to update the performance readout.
+    const gpuTimer = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+    const pendingGpuQueries = [];
+    const maxPendingGpuQueries = 8;
+    let gpuRenderTimeNs = 0;
+    let gpuRenderSamples = 0;
+    let gpuStatsWindowStart = performance.now();
+
+    if (!gpuTimer) {
+        fps.innerText = "GPU timing unavailable";
+    }
+
+    const beginGpuRenderTimer = () => {
+        if (!gpuTimer || pendingGpuQueries.length >= maxPendingGpuQueries) {
+            return null;
+        }
+        const query = gl.createQuery();
+        if (!query) return null;
+        gl.beginQuery(gpuTimer.TIME_ELAPSED_EXT, query);
+        return query;
+    };
+
+    const endGpuRenderTimer = (query) => {
+        if (!query) return;
+        gl.endQuery(gpuTimer.TIME_ELAPSED_EXT);
+        pendingGpuQueries.push(query);
+    };
+
+    const resetGpuRenderStats = (now = performance.now()) => {
+        for (const query of pendingGpuQueries) gl.deleteQuery(query);
+        pendingGpuQueries.length = 0;
+        gpuRenderTimeNs = 0;
+        gpuRenderSamples = 0;
+        gpuStatsWindowStart = now;
+    };
+
+    const collectGpuRenderStats = (now) => {
+        if (!gpuTimer) return;
+
+        if (gl.getParameter(gpuTimer.GPU_DISJOINT_EXT)) {
+            resetGpuRenderStats(now);
+            return;
+        }
+
+        while (pendingGpuQueries.length > 0) {
+            const query = pendingGpuQueries[0];
+            if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) break;
+
+            const elapsedNs = gl.getQueryParameter(query, gl.QUERY_RESULT);
+            gl.deleteQuery(query);
+            pendingGpuQueries.shift();
+            if (Number.isFinite(elapsedNs) && elapsedNs > 0) {
+                gpuRenderTimeNs += elapsedNs;
+                gpuRenderSamples++;
+            }
+        }
+
+        if (now - gpuStatsWindowStart >= 1000 && gpuRenderSamples > 0) {
+            const averageRenderNs = gpuRenderTimeNs / gpuRenderSamples;
+            const renderFps = 1e9 / averageRenderNs;
+            const renderMs = averageRenderNs / 1e6;
+            fps.innerText = `${Math.round(renderFps)} render fps · ${renderMs.toFixed(2)} ms GPU`;
+            gpuRenderTimeNs = 0;
+            gpuRenderSamples = 0;
+            gpuStatsWindowStart = now;
+        }
+    };
+
     const vertexShader = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vertexShader, vertexShaderSource);
     gl.compileShader(vertexShader);
@@ -2775,8 +2845,6 @@ async function main() {
     let jumpDelta = 0;
     let vertexCount = 0;
 
-    let fpsWindowStart = null;
-    let fpsFrameCount = 0;
     let start = 0;
 
     window.addEventListener("gamepadconnected", (e) => {
@@ -2792,6 +2860,8 @@ async function main() {
     let leftGamepadTrigger, rightGamepadTrigger;
 
     const frame = (now) => {
+        collectGpuRenderStats(now);
+
         if (dynamicScene && dynamicPlayback) {
             if (lastDynamicAnimationAt !== null) {
                 const nextTime = (dynamicTime + (now - lastDynamicAnimationAt) / (dynamicLoopSeconds * 1000)) % 1;
@@ -2999,6 +3069,7 @@ async function main() {
         if (vertexCount > 0) {
             document.getElementById("spinner").style.display = "none";
             gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
+            const gpuRenderQuery = beginGpuRenderTimer();
             gl.clear(gl.COLOR_BUFFER_BIT);
 
             gl.activeTexture(gl.TEXTURE0);
@@ -3016,6 +3087,7 @@ async function main() {
             }
 
             gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            endGpuRenderTimer(gpuRenderQuery);
 
             if (debugWebGL) {
                 const drawError = gl.getError();
@@ -3027,21 +3099,6 @@ async function main() {
             gl.clear(gl.COLOR_BUFFER_BIT);
             document.getElementById("spinner").style.display = "";
             start = Date.now() + 2000;
-        }
-        if (fpsWindowStart === null || now - fpsWindowStart > 2000) {
-            // Initialize without counting a zero-duration first frame, and
-            // discard long gaps caused by a suspended/background browser tab.
-            fpsWindowStart = now;
-            fpsFrameCount = 0;
-        } else {
-            fpsFrameCount++;
-            const fpsElapsed = now - fpsWindowStart;
-            if (fpsElapsed >= 1000) {
-                const measuredFps = fpsFrameCount * 1000 / fpsElapsed;
-                fps.innerText = Math.round(measuredFps) + " fps";
-                fpsWindowStart = now;
-                fpsFrameCount = 0;
-            }
         }
         if (isNaN(currentCameraIndex)) {
             camid.innerText = "";
