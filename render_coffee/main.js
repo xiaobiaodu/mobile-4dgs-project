@@ -4,7 +4,7 @@ window.FLUX_GS_CONFIG = {
     // 300 uniformly sampled frames; smooth playback evaluates the learned
     // motion continuously to reconstruct the three frames between samples.
     dynamicLoopSeconds: 1200/30/4,
-    dynamicSortFps: 10,
+    dynamicSortFps: 30,
     smoothDynamicPlayback: true,
     dynamicShDuringPlayback: false,
 };
