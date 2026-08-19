@@ -310,6 +310,13 @@ function createWorker(self) {
     let depthIndex = new Uint32Array();
     let lastVertexCount = 0;
     let sortRunning;
+    // Reusable scratch buffers for the 16-bit counting sort in runSort().
+    // Grown only when the model grows. counts0 is re-zeroed each pass;
+    // starts0 is fully rewritten by the prefix sum except index 0 (reset
+    // below); sizeList is fully overwritten by the depth loop.
+    let sizeList = new Int32Array(0);
+    let counts0 = new Uint32Array(256 * 256);
+    let starts0 = new Uint32Array(256 * 256);
     // Dynamic scenes store the FreeTimeGS parameters in this layout per point:
     // velocity.xyz, acceleration.xyz, canonical time, log(duration).
     // Keep it in the worker for time-aware depth sorting and send a copied GPU
@@ -739,7 +746,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
 
         let maxDepth = -Infinity;
         let minDepth = Infinity;
-        let sizeList = new Int32Array(vertexCount);
+        if (sizeList.length < vertexCount) sizeList = new Int32Array(vertexCount);
         for (let i = 0; i < vertexCount; i++) {
             let x = f_buffer[8 * i + 0];
             let y = f_buffer[8 * i + 1];
@@ -762,12 +769,12 @@ function contractToUnisphereInPlace(x, y, z, out) {
 
         // This is a 16 bit single-pass counting sort
         let depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
-        let counts0 = new Uint32Array(256 * 256);
+        counts0.fill(0);
         for (let i = 0; i < vertexCount; i++) {
             sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
             counts0[sizeList[i]]++;
         }
-        let starts0 = new Uint32Array(256 * 256);
+        starts0[0] = 0;
         for (let i = 1; i < 256 * 256; i++)
             starts0[i] = starts0[i - 1] + counts0[i - 1];
         depthIndex = new Uint32Array(vertexCount);
@@ -1752,9 +1759,17 @@ void main() {
         vec4 temporal;
         getDynamicMotion(index, motion, temporal);
         float dt = u_time - motion.w;
-        center_world += motion.xyz * dt + 0.5 * temporal.xyz * dt * dt;
         float duration = max(exp(temporal.w), 1e-4);
-        temporalOpacity = exp(-0.5 * pow(dt / (duration + 1e-8), 2.0));
+        float ndt = dt / (duration + 1e-8);
+        temporalOpacity = exp(-0.5 * ndt * ndt);
+        // Lossless temporal cull: below 1 LSB of 8-bit alpha the Gaussian
+        // cannot contribute, so skip the expensive projection/covariance/SH
+        // work and emit a clipped (degenerate) vertex.
+        if (temporalOpacity < (1.0 / 255.0)) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+        center_world += motion.xyz * dt + 0.5 * temporal.xyz * dt * dt;
     }
     vec4 cam = view * vec4(center_world, 1);
     vec4 pos2d = projection * cam;
@@ -2483,8 +2498,12 @@ async function main() {
                 uploadShTexture(e.data.dynamicSh);
             }
             gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             vertexCount = e.data.vertexCount;
+            if (indexBufferCapacity !== vertexCount) {
+                indexBufferCapacity = vertexCount;
+                gl.bufferData(gl.ARRAY_BUFFER, vertexCount * 4, gl.DYNAMIC_DRAW);
+            }
+            gl.bufferSubData(gl.ARRAY_BUFFER, 0, depthIndex);
             if (isDynamicFrame) {
                 // The default path commits all dynamic state atomically. A
                 // smooth-playback scene advances motion in the vertex shader
@@ -2774,6 +2793,8 @@ async function main() {
 
     let jumpDelta = 0;
     let vertexCount = 0;
+    let indexBufferCapacity = 0;
+    let lastPostedViewProj = null;
 
     let fpsWindowStart = null;
     let fpsFrameCount = 0;
@@ -2994,7 +3015,18 @@ async function main() {
         gl.uniform3fv(u_camPos, cameraPos);
 
         const viewProj = multiply4(projectionMatrix, actualViewMatrix);
-        worker.postMessage({ view: viewProj });
+        // Only re-sort (and wake the worker) when the depth direction changes.
+        // The worker derives depth order from viewProj[2],[6],[10] alone, so
+        // roll and translation (which don't affect depth order) are skipped.
+        if (
+            !lastPostedViewProj ||
+            lastPostedViewProj[2] !== viewProj[2] ||
+            lastPostedViewProj[6] !== viewProj[6] ||
+            lastPostedViewProj[10] !== viewProj[10]
+        ) {
+            lastPostedViewProj = viewProj;
+            worker.postMessage({ view: viewProj });
+        }
 
         if (vertexCount > 0) {
             document.getElementById("spinner").style.display = "none";
