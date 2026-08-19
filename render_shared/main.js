@@ -1846,6 +1846,169 @@ void main () {
 
 `.trim();
 
+// Pass 1 of the two-pass pipeline: compute per-Gaussian color/quad axes once
+// (instead of 4x per Gaussian) and capture them with transform feedback. The
+// math is a byte-for-byte copy of vertexShaderSource's main(), differing only
+// in that the final corner assembly is emitted as TF varyings rather than
+// gl_Position. Culled Gaussians emit a degenerate (zero-area) quad so pass 2
+// rasterizes nothing, exactly like the original degenerate gl_Position.
+const computeShaderSource = `
+#version 300 es
+precision highp float;
+precision highp int;
+
+uniform highp usampler2D u_texture;
+uniform highp sampler2D u_sh_texture;
+uniform highp sampler2D u_dynamic_texture;
+uniform mat4 projection, view;
+uniform vec2 focal;
+uniform vec2 viewport;
+uniform vec3 camPos;
+uniform float u_time;
+uniform int u_dynamic_enabled;
+
+in int index;
+
+out vec4 tfColor;
+out vec4 tfQuad0;
+out vec4 tfQuad1;
+
+const float SH_C0 = 0.28209479177387814;
+const float SH_C1 = 0.4886025119029199;
+
+float computeSHChannel(vec3 dir, int channel, int vertexIndex) {
+    int texWidth = 8192;
+
+    int pixelIndex = vertexIndex * 3 + channel;
+    ivec2 texCoord = ivec2(pixelIndex % texWidth, pixelIndex / texWidth);
+
+    vec4 sh = texelFetch(u_sh_texture, texCoord, 0);
+
+    float x = dir.x, y = dir.y, z = dir.z;
+
+    float result = SH_C0 * sh.x;
+
+    result = result - SH_C1 * y * sh.y + SH_C1 * z * sh.z - SH_C1 * x * sh.w;
+
+    return clamp(result + 0.5, 0.0, 1.0);
+}
+
+void getDynamicMotion(int vertexIndex, out vec4 motion, out vec4 temporal) {
+    const int dynamicTexWidth = 2048;
+    int firstPixel = vertexIndex * 2;
+    ivec2 firstCoord = ivec2(firstPixel % dynamicTexWidth, firstPixel / dynamicTexWidth);
+    int secondPixel = firstPixel + 1;
+    ivec2 secondCoord = ivec2(secondPixel % dynamicTexWidth, secondPixel / dynamicTexWidth);
+    motion = texelFetch(u_dynamic_texture, firstCoord, 0);
+    temporal = texelFetch(u_dynamic_texture, secondCoord, 0);
+}
+
+void main() {
+    uvec4 cen = texelFetch(u_texture, ivec2((uint(index) & 0x3ffu) << 1, uint(index) >> 10), 0);
+    vec3 center_world = uintBitsToFloat(cen.xyz);
+    float temporalOpacity = 1.0;
+    if (u_dynamic_enabled != 0) {
+        vec4 motion;
+        vec4 temporal;
+        getDynamicMotion(index, motion, temporal);
+        float dt = u_time - motion.w;
+        float duration = max(exp(temporal.w), 1e-4);
+        float ndt = dt / (duration + 1e-8);
+        temporalOpacity = exp(-0.5 * ndt * ndt);
+        if (temporalOpacity < (1.0 / 255.0)) {
+            tfColor = vec4(0.0);
+            tfQuad0 = vec4(0.0);
+            tfQuad1 = vec4(0.0);
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+        center_world += motion.xyz * dt + 0.5 * temporal.xyz * dt * dt;
+    }
+    vec4 cam = view * vec4(center_world, 1);
+    vec4 pos2d = projection * cam;
+
+    float clip = 1.2 * pos2d.w;
+    if (pos2d.z < -clip || pos2d.x < -clip || pos2d.x > clip || pos2d.y < -clip || pos2d.y > clip) {
+        tfColor = vec4(0.0);
+        tfQuad0 = vec4(0.0);
+        tfQuad1 = vec4(0.0);
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    uvec4 cov = texelFetch(u_texture, ivec2(((uint(index) & 0x3ffu) << 1) | 1u, uint(index) >> 10), 0);
+    vec2 u1 = unpackHalf2x16(cov.x), u2 = unpackHalf2x16(cov.y), u3 = unpackHalf2x16(cov.z);
+    mat3 Vrk = mat3(u1.x, u1.y, u2.x, u1.y, u2.y, u3.x, u2.x, u3.x, u3.y);
+
+    mat3 J = mat3(
+        focal.x / cam.z, 0., -(focal.x * cam.x) / (cam.z * cam.z),
+        0., -focal.y / cam.z, (focal.y * cam.y) / (cam.z * cam.z),
+        0., 0., 0.
+    );
+
+    mat3 T = transpose(mat3(view)) * J;
+    mat3 cov2d = transpose(T) * Vrk * T;
+    cov2d[0][0] += 0.3;
+    cov2d[1][1] += 0.3;
+
+    float mid = (cov2d[0][0] + cov2d[1][1]) / 2.0;
+    float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
+    float lambda1 = mid + radius, lambda2 = mid - radius;
+
+    if (lambda2 < 0.0) {
+        tfColor = vec4(0.0);
+        tfQuad0 = vec4(0.0);
+        tfQuad1 = vec4(0.0);
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+    vec2 diagonalVector = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
+    vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
+    vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
+
+    vec3 view_dir = normalize(center_world - camPos);
+
+    float r = computeSHChannel(view_dir, 0, index);
+    float g = computeSHChannel(view_dir, 1, index);
+    float b = computeSHChannel(view_dir, 2, index);
+
+    float alpha = float((cov.w >> 24) & 0xffu) / 255.0 * temporalOpacity;
+    tfColor = vec4(r, g, b, alpha);
+
+    vec2 vCenter = vec2(pos2d) / pos2d.w;
+    tfQuad0 = vec4(vCenter, majorAxis);
+    tfQuad1 = vec4(minorAxis, 0.0, 0.0);
+
+    gl_Position = vec4(vCenter, 0.0, 1.0);
+}
+`.trim();
+
+// Pass 2 of the two-pass pipeline: assemble the quad from the TF record.
+const drawVertexShaderSource = `
+#version 300 es
+precision highp float;
+precision highp int;
+
+in vec2 position;
+in vec4 tfColor;
+in vec4 tfQuad0;
+in vec4 tfQuad1;
+
+uniform vec2 viewport;
+
+out vec4 vColor;
+out vec2 vPosition;
+
+void main() {
+    vColor = tfColor;
+    vPosition = position;
+    gl_Position = vec4(
+        tfQuad0.xy
+        + 2.0 * position.x * tfQuad0.zw / viewport
+        + 2.0 * position.y * tfQuad1.xy / viewport, 0.0, 1.0);
+}
+`.trim();
+
 let defaultViewMatrix = [
     0.47, 0.04, 0.88, 0, -0.11, 0.99, 0.02, 0, -0.88, -0.11, 0.47, 0, 0.07,
     0.03, 6.55, 1,
@@ -2198,6 +2361,87 @@ async function main() {
     gl.vertexAttribIPointer(a_index, 1, gl.INT, false, 0, 0);
     gl.vertexAttribDivisor(a_index, 1);
 
+    // ---- Two-pass transform-feedback pipeline. Pass 1 computes per-Gaussian
+    // color/quad axes once (instead of 4x per Gaussian); pass 2 assembles the
+    // quad. Lossless; falls back to the single-pass path above if TF is
+    // unavailable or errors on the first frame. ----
+    const computeProgram = gl.createProgram();
+    const computeVertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(computeVertexShader, computeShaderSource);
+    gl.compileShader(computeVertexShader);
+    if (!gl.getShaderParameter(computeVertexShader, gl.COMPILE_STATUS))
+        console.error(gl.getShaderInfoLog(computeVertexShader));
+    gl.attachShader(computeProgram, computeVertexShader);
+    gl.transformFeedbackVaryings(
+        computeProgram,
+        ["tfColor", "tfQuad0", "tfQuad1"],
+        gl.INTERLEAVED_ATTRIBS,
+    );
+    gl.linkProgram(computeProgram);
+    let useTwoPass = gl.getProgramParameter(computeProgram, gl.LINK_STATUS);
+    if (!useTwoPass) console.error(gl.getProgramInfoLog(computeProgram));
+
+    const drawProgram = gl.createProgram();
+    const drawVertexShader = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(drawVertexShader, drawVertexShaderSource);
+    gl.compileShader(drawVertexShader);
+    if (!gl.getShaderParameter(drawVertexShader, gl.COMPILE_STATUS))
+        console.error(gl.getShaderInfoLog(drawVertexShader));
+    gl.attachShader(drawProgram, drawVertexShader);
+    gl.attachShader(drawProgram, fragmentShader);
+    gl.linkProgram(drawProgram);
+    if (!gl.getProgramParameter(drawProgram, gl.LINK_STATUS)) {
+        useTwoPass = false;
+        console.error(gl.getProgramInfoLog(drawProgram));
+    }
+
+    const splatComputeBuffer = gl.createBuffer();
+
+    // Compute-pass uniforms (projection/focal set in resize; view/camPos/time
+    // set per frame in the draw section).
+    const cProjection = gl.getUniformLocation(computeProgram, "projection");
+    const cFocal = gl.getUniformLocation(computeProgram, "focal");
+    const cView = gl.getUniformLocation(computeProgram, "view");
+    const cCamPos = gl.getUniformLocation(computeProgram, "camPos");
+    const cTime = gl.getUniformLocation(computeProgram, "u_time");
+    const cDynamicEnabled = gl.getUniformLocation(computeProgram, "u_dynamic_enabled");
+    const dViewport = gl.getUniformLocation(drawProgram, "viewport");
+    gl.useProgram(computeProgram);
+    gl.uniform1i(gl.getUniformLocation(computeProgram, "u_texture"), 0);
+    gl.uniform1i(gl.getUniformLocation(computeProgram, "u_sh_texture"), 1);
+    gl.uniform1i(gl.getUniformLocation(computeProgram, "u_dynamic_texture"), 2);
+    gl.useProgram(program);
+
+    // Compute-pass VAO: `index` as a per-vertex attribute over the sorted index.
+    const computeVao = gl.createVertexArray();
+    gl.bindVertexArray(computeVao);
+    const aComputeIndex = gl.getAttribLocation(computeProgram, "index");
+    gl.enableVertexAttribArray(aComputeIndex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+    gl.vertexAttribIPointer(aComputeIndex, 1, gl.INT, false, 0, 0);
+
+    // Draw-pass VAO: `position` per-vertex + TF records per-instance.
+    const drawVao = gl.createVertexArray();
+    gl.bindVertexArray(drawVao);
+    const aDrawPosition = gl.getAttribLocation(drawProgram, "position");
+    gl.enableVertexAttribArray(aDrawPosition);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    gl.vertexAttribPointer(aDrawPosition, 2, gl.FLOAT, false, 0, 0);
+    const aTfColor = gl.getAttribLocation(drawProgram, "tfColor");
+    const aTfQuad0 = gl.getAttribLocation(drawProgram, "tfQuad0");
+    const aTfQuad1 = gl.getAttribLocation(drawProgram, "tfQuad1");
+    gl.enableVertexAttribArray(aTfColor);
+    gl.enableVertexAttribArray(aTfQuad0);
+    gl.enableVertexAttribArray(aTfQuad1);
+    gl.bindBuffer(gl.ARRAY_BUFFER, splatComputeBuffer);
+    gl.vertexAttribPointer(aTfColor, 4, gl.FLOAT, false, 48, 0);
+    gl.vertexAttribPointer(aTfQuad0, 4, gl.FLOAT, false, 48, 16);
+    gl.vertexAttribPointer(aTfQuad1, 4, gl.FLOAT, false, 48, 32);
+    gl.vertexAttribDivisor(aTfColor, 1);
+    gl.vertexAttribDivisor(aTfQuad0, 1);
+    gl.vertexAttribDivisor(aTfQuad1, 1);
+    gl.bindVertexArray(null);
+
     const resize = () => {
         const renderWidth = Math.max(1, Math.round(innerWidth / downsample));
         const renderHeight = Math.max(1, Math.round(innerHeight / downsample));
@@ -2222,6 +2466,15 @@ async function main() {
             renderHeight,
         );
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
+
+        if (useTwoPass) {
+            gl.useProgram(computeProgram);
+            gl.uniform2fv(cFocal, new Float32Array([focalX, focalY]));
+            gl.uniformMatrix4fv(cProjection, false, projectionMatrix);
+            gl.useProgram(drawProgram);
+            gl.uniform2fv(dViewport, new Float32Array([renderWidth, renderHeight]));
+            gl.useProgram(program);
+        }
     };
 
     window.addEventListener("resize", resize);
@@ -2504,6 +2757,12 @@ async function main() {
                 gl.bufferData(gl.ARRAY_BUFFER, vertexCount * 4, gl.DYNAMIC_DRAW);
             }
             gl.bufferSubData(gl.ARRAY_BUFFER, 0, depthIndex);
+            if (useTwoPass && splatComputeCapacity !== vertexCount) {
+                splatComputeCapacity = vertexCount;
+                gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, splatComputeBuffer);
+                gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, vertexCount * 48, gl.DYNAMIC_DRAW);
+                gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, null);
+            }
             if (isDynamicFrame) {
                 // The default path commits all dynamic state atomically. A
                 // smooth-playback scene advances motion in the vertex shader
@@ -2794,7 +3053,9 @@ async function main() {
     let jumpDelta = 0;
     let vertexCount = 0;
     let indexBufferCapacity = 0;
+    let splatComputeCapacity = 0;
     let lastPostedViewProj = null;
+    let twoPassVerified = false;
 
     let fpsWindowStart = null;
     let fpsFrameCount = 0;
@@ -3030,7 +3291,6 @@ async function main() {
 
         if (vertexCount > 0) {
             document.getElementById("spinner").style.display = "none";
-            gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
             gl.activeTexture(gl.TEXTURE0);
@@ -3047,7 +3307,50 @@ async function main() {
                 }
             }
 
-            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            if (useTwoPass) {
+                // Pass 1: compute per-Gaussian color/quad axes once.
+                gl.useProgram(computeProgram);
+                gl.bindVertexArray(computeVao);
+                gl.uniformMatrix4fv(cView, false, actualViewMatrix);
+                gl.uniform3fv(cCamPos, cameraPos);
+                gl.uniform1f(cTime, renderedDynamicTime);
+                gl.uniform1i(cDynamicEnabled, dynamicScene ? 1 : 0);
+                gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, splatComputeBuffer);
+                gl.enable(gl.RASTERIZER_DISCARD);
+                gl.beginTransformFeedback(gl.POINTS);
+                gl.drawArrays(gl.POINTS, 0, vertexCount);
+                gl.endTransformFeedback();
+                gl.disable(gl.RASTERIZER_DISCARD);
+                gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+
+                // Pass 2: assemble quads from the TF records.
+                gl.useProgram(drawProgram);
+                gl.bindVertexArray(drawVao);
+                gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+
+                // First-frame smoke test: a GL error here (e.g. a driver that
+                // rejects transform feedback) falls back to single-pass for good.
+                if (!twoPassVerified) {
+                    twoPassVerified = true;
+                    if (gl.getError() !== gl.NO_ERROR) {
+                        useTwoPass = false;
+                        console.error(
+                            "Transform feedback errored; falling back to single-pass.",
+                        );
+                    }
+                }
+
+                // Restore the single-pass program + default VAO so per-frame
+                // uniform updates elsewhere (camPos, u_time, resize) keep
+                // targeting the fallback program between frames.
+                gl.useProgram(program);
+                gl.bindVertexArray(null);
+            } else {
+                gl.useProgram(program);
+                gl.bindVertexArray(null);
+                gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
+                gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            }
 
             if (debugWebGL) {
                 const drawError = gl.getError();
