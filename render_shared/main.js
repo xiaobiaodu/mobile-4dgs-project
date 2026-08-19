@@ -2152,7 +2152,7 @@ async function main() {
         : !["0", "false", "off"].includes(dynamicAutoplayParam.toLowerCase());
     const modelBaseUrl =
         viewerConfig.modelBaseUrl ||
-        "https://huggingface.co/datasets/mobile-gs2/mobile-gs2-dynamic/resolve/main/";
+        "https://huggingface.co/datasets/mobile-gs2/mobile-4dgs/resolve/main/";
     const configuredCameraUrl = params.get("cameraUrl") ?? viewerConfig.cameraUrl;
     const isCameraList = (candidate) =>
         Array.isArray(candidate) && candidate.length > 0 && candidate.every((entry) =>
