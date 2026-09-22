@@ -63,8 +63,32 @@ optional `time` field, selecting that camera pauses playback at its frame time.
 scene page. `cameraUrl` should point to the Mobile-GS2 `cameras.json` that was
 exported with that model; its intrinsics are rescaled to the actual WebGL
 framebuffer before calculating Gaussian footprints.
+
 Dynamic scenes advance GPU motion at display refresh rate by default. Set
 `smoothDynamicPlayback: false` to restore worker-synchronized motion.
+
+### Fill rate
+
+`renderScale` (or `?renderScale=`) sets the drawing buffer as a fraction of the
+size the viewer would otherwise pick, in `(0, 2]`; the browser then scales that
+buffer up to the CSS box. A value below one trades sharpness for fragment
+throughput without changing the geometry: the intrinsics, the projection and the
+Gaussian footprints are all derived from `renderWidth`/`renderHeight`, so a
+smaller buffer renders the same image, only softer. The default of `1` keeps the
+previous behaviour, and the resolution actually in use is shown next to the FPS
+counter.
+
+Because Gaussian splatting is fill rate bound on mobile, this is usually a
+larger lever than any sorting change: halving both axes quarters the shaded
+pixels. `setRenderScale(0.5)` from the console applies a new factor in place,
+without reloading the model, which makes a quick sweep practical:
+
+```js
+for (const scale of [1, 0.75, 0.5, 0.35, 0.25]) {
+    setRenderScale(scale);
+    await new Promise((done) => setTimeout(done, 3000));
+}
+```
 
 ### Adaptive sort scheduling
 
@@ -125,6 +149,7 @@ python -m http.server 8000
 | `cam` | `fixed` pins one camera before measuring (default); `carousel` keeps the orbiting demo camera |
 | `sortFps` | `dynamicSortFps`, where `0` is uncapped |
 | `adaptive`, `budget` | `adaptiveSort` and `adaptiveSortBudget` |
+| `renderScale` | drawing buffer fraction, `1` is full size (fills the `scale` column) |
 | `smooth`, `loop`, `sec`, `warm` | smooth playback, clip length, measured window, warmup |
 | `auto` | start measuring as soon as the model renders |
 | `panel` | `0` hides the panel; drive the bench from `window.BenchView` in the console instead |

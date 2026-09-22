@@ -18,6 +18,7 @@
         sortFps: 10,
         adaptive: 1,
         budget: 0.5,
+        renderScale: 1,
         smooth: 1,
         loop: 10,
         sec: 10,
@@ -55,6 +56,7 @@
         { key: "loopSeconds", label: "loopS" },
         { key: "measuredSeconds", label: "sec" },
         { key: "renderSize", label: "render" },
+        { key: "renderScale", label: "scale" },
         { key: "dpr", label: "dpr" },
         { key: "glRenderer", label: "gpu" },
         { key: "hardwareConcurrency", label: "cores" },
@@ -202,6 +204,7 @@
         if (config.adaptive !== 1) config.adaptive = 0;
         if (!(config.budget >= 0)) config.budget = 0;
         if (!(config.sortFps >= 0)) config.sortFps = 0;
+        if (!(config.renderScale > 0) || config.renderScale > 2) config.renderScale = 1;
         if (!(config.sec > 0)) config.sec = CONFIG_DEFAULTS.sec;
         if (!(config.warm >= 0)) config.warm = 0;
         if (!(config.loop > 0)) config.loop = CONFIG_DEFAULTS.loop;
@@ -341,6 +344,7 @@
             loopSeconds: meta.loopSeconds,
             measuredSeconds: round(seconds, 2),
             renderSize: meta.renderSize || "",
+            renderScale: round(meta.renderScale, 2),
             dpr: round(meta.dpr, 2),
             glRenderer: meta.glRenderer || "",
             hardwareConcurrency: meta.hardwareConcurrency || "",

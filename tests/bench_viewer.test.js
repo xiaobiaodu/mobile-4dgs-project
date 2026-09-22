@@ -56,6 +56,9 @@ test("config parses typed query values and clamps what is out of range", () => {
 
     assert.equal(M.parseConfig("?adaptive=2").adaptive, 0, "adaptive is a flag");
     assert.equal(M.parseConfig("?si=3").si, 3);
+    assert.equal(M.parseConfig("?renderScale=0.5").renderScale, 0.5);
+    assert.equal(M.parseConfig("?renderScale=0").renderScale, 1, "zero is not a scale");
+    assert.equal(M.parseConfig("?renderScale=5").renderScale, 1, "above 2 would upscale");
 });
 
 test("configToSearch omits defaults and round trips", () => {

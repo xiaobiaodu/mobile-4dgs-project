@@ -2254,6 +2254,7 @@ function ensureViewerDom() {
         <canvas id="canvas"></canvas>
         <div id="quality">
             <span id="fps"></span>
+            <span id="render-size"></span>
         </div>
         <div id="caminfo">
             <span id="camid"></span>
@@ -2364,6 +2365,19 @@ async function main() {
         viewerConfig.adaptiveSort !== false &&
         Number.isFinite(configuredSortBudget) && configuredSortBudget >= 0;
     const adaptiveSortBudget = adaptiveSortEnabled ? configuredSortBudget : 0;
+    // Fill rate knob.  The drawing buffer is created at this fraction of the
+    // size the viewer would otherwise pick, and the browser scales it up to the
+    // CSS box, so a value below one trades sharpness for fragment throughput.
+    // The intrinsics and the projection follow renderWidth/renderHeight, so the
+    // image stays geometrically correct - it is only softer.  At the default of
+    // one the viewer behaves exactly as before.
+    const configuredRenderScale = Number(
+        params.get("renderScale") ?? viewerConfig.renderScale ?? 1,
+    );
+    let renderScale = Number.isFinite(configuredRenderScale) &&
+        configuredRenderScale > 0 && configuredRenderScale <= 2
+        ? configuredRenderScale
+        : 1;
     const dynamicAutoplayParam = params.get("dynamicAutoplay");
     const initialDynamicPlayback = dynamicAutoplayParam === null
         ? viewerConfig.dynamicAutoplay !== false
@@ -2478,6 +2492,7 @@ async function main() {
 
     const canvas = document.getElementById("canvas");
     const fps = document.getElementById("fps");
+    const renderSizeLabel = document.getElementById("render-size");
     const camid = document.getElementById("camid");
 
     let projectionMatrix;
@@ -2586,8 +2601,8 @@ async function main() {
     gl.vertexAttribDivisor(a_index, 1);
 
     const resize = () => {
-        const renderWidth = Math.max(1, Math.round(innerWidth / downsample));
-        const renderHeight = Math.max(1, Math.round(innerHeight / downsample));
+        const renderWidth = Math.max(1, Math.round((innerWidth / downsample) * renderScale));
+        const renderHeight = Math.max(1, Math.round((innerHeight / downsample) * renderScale));
         gl.canvas.width = renderWidth;
         gl.canvas.height = renderHeight;
         gl.viewport(0, 0, renderWidth, renderHeight);
@@ -2609,10 +2624,27 @@ async function main() {
             renderHeight,
         );
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
+        if (renderSizeLabel) {
+            renderSizeLabel.innerText = renderWidth + "x" + renderHeight +
+                (renderScale === 1 ? "" : " @" + renderScale + "x");
+        }
     };
 
     window.addEventListener("resize", resize);
     resize();
+    // The knob is also reachable from the console, so a fill rate sweep does not
+    // have to reload the model: setRenderScale(0.5) re-creates the drawing
+    // buffer and the projection in place.
+    window.setRenderScale = (value) => {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next <= 0 || next > 2) {
+            console.warn("setRenderScale expects a factor in (0, 2]; got", value);
+            return renderScale;
+        }
+        renderScale = next;
+        resize();
+        return renderScale;
+    };
 
     const dynamicControls = document.getElementById("dynamic-controls");
     const dynamicPlayButton = document.getElementById("dynamic-play");
