@@ -19,6 +19,8 @@
         adaptive: 1,
         budget: 0.5,
         renderScale: 1,
+        lod: 1,
+        minPixelRadius: 0,
         smooth: 1,
         loop: 10,
         sec: 10,
@@ -57,6 +59,8 @@
         { key: "measuredSeconds", label: "sec" },
         { key: "renderSize", label: "render" },
         { key: "renderScale", label: "scale" },
+        { key: "lod", label: "lod" },
+        { key: "minPixelRadius", label: "cullPx" },
         { key: "dpr", label: "dpr" },
         { key: "glRenderer", label: "gpu" },
         { key: "hardwareConcurrency", label: "cores" },
@@ -205,6 +209,8 @@
         if (!(config.budget >= 0)) config.budget = 0;
         if (!(config.sortFps >= 0)) config.sortFps = 0;
         if (!(config.renderScale > 0) || config.renderScale > 2) config.renderScale = 1;
+        if (!(config.lod > 0) || config.lod > 1) config.lod = 1;
+        if (!(config.minPixelRadius >= 0)) config.minPixelRadius = 0;
         if (!(config.sec > 0)) config.sec = CONFIG_DEFAULTS.sec;
         if (!(config.warm >= 0)) config.warm = 0;
         if (!(config.loop > 0)) config.loop = CONFIG_DEFAULTS.loop;
@@ -345,6 +351,8 @@
             measuredSeconds: round(seconds, 2),
             renderSize: meta.renderSize || "",
             renderScale: round(meta.renderScale, 2),
+            lod: round(meta.lod, 2),
+            minPixelRadius: round(meta.minPixelRadius, 2),
             dpr: round(meta.dpr, 2),
             glRenderer: meta.glRenderer || "",
             hardwareConcurrency: meta.hardwareConcurrency || "",

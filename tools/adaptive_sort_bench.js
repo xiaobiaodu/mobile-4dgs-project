@@ -10,6 +10,7 @@
 //
 //   node tools/adaptive_sort_bench.js [--count=200000] [--dynamic=0.08]
 //        [--extent=60] [--speed=2] [--seconds=6] [--seed=7]
+//        [--focal=800] [--cull=4]
 
 "use strict";
 
@@ -39,6 +40,8 @@ function parseArgs(argv) {
         seconds: 6,
         seed: 7,
         requestHz: 30,
+        focal: 800,
+        cull: 0,
     };
     for (const argument of argv) {
         const match = argument.match(/^--([a-z]+)=(.+)$/i);
@@ -256,7 +259,16 @@ async function runConfig(harness, scene, options, config) {
     await harness.send({
         adaptiveSort: { enabled: config.budget !== null, budget: config.budget ?? 0 },
     });
-    await harness.send({ view: VIEW_PROJECTION });
+    // The threshold is worker state that outlives a configuration, so every run
+    // states its own value instead of inheriting the previous one.
+    await harness.send({ minPixelRadius: config.cull || 0 });
+    // The depth row of a camera looking down -z, with the near half of the box
+    // in front of it.  The cull stays off until a threshold arrives.
+    await harness.send({
+        view: VIEW_PROJECTION,
+        focal: options.focal,
+        viewDepthRow: [0, 0, 1, 0],
+    });
     await harness.send({ time: 0, dynamicRequestId: 0 });
     harness.resetCounters();
     messages.length = 0;
@@ -281,6 +293,8 @@ async function runConfig(harness, scene, options, config) {
     let worstRadii = 0;
     let ageSum = 0;
     let samples = 0;
+    let drawSum = 0;
+    let commits = 0;
 
     for (let frame = 0; frame < frames; frame++) {
         const playbackSeconds = frame / DISPLAY_HZ;
@@ -298,6 +312,8 @@ async function runConfig(harness, scene, options, config) {
                     order = message.depthIndex;
                     commitTime = time;
                     sorts++;
+                    drawSum += message.depthIndex.length;
+                    commits++;
                     gapMin = message.sortStats ? message.sortStats.adaptiveGapMin : undefined;
                     depthBytes += message.depthIndex.byteLength;
                 }
@@ -333,6 +349,7 @@ async function runConfig(harness, scene, options, config) {
         meanAge: samples > 0 ? ageSum / samples : 0,
         gapMin,
         animated,
+        drawnFraction: commits > 0 ? drawSum / commits / scene.count : 1,
     };
 }
 
@@ -366,6 +383,12 @@ async function main() {
     const keysPerSecond = options.speed * DEPTH_KEY_SCALE *
         Math.hypot(VIEW_PROJECTION[2], VIEW_PROJECTION[6], VIEW_PROJECTION[10]);
     const movementPerSort = keysPerSecond * (1 / options.requestHz) / options.seconds;
+    const cullPixels = options.cull > 0 ? options.cull : 4;
+    // Only the half of the box in front of the camera projects a radius at all,
+    // and a row survives while it is within focal * radius / threshold of the
+    // camera plane.
+    const cullReach = options.focal * Math.exp(-2) / cullPixels;
+    const culledShare = Math.min(0.5, Math.max(0, 0.5 - cullReach / options.extent));
     let keyMin = Infinity;
     let keyMax = -Infinity;
     for (let i = 0; i < keys.length; i++) {
@@ -381,6 +404,9 @@ async function main() {
         `playback   ${options.seconds}s clip over ${options.seconds}s wall time, ` +
         `${DISPLAY_HZ} Hz display, requests at ${options.requestHz} Hz`,
         `motion     about ${movementPerSort.toFixed(1)} depth keys between two requests`,
+        `cull       ${cullPixels} px at focal ${options.focal} px: rows further than ` +
+        `${cullReach.toFixed(1)} units drop out of the far half of the box, about ` +
+        `${(100 * culledShare).toFixed(0)}% of all Gaussians`,
         `gaps       ${(100 * tight / movable).toFixed(1)}% of the ` +
         `${movable.toLocaleString()} movable adjacent pairs are within 2 depth keys ` +
         `(the 16 bit counting sort itself resolves about ` +
@@ -397,6 +423,8 @@ async function main() {
         { name: "adaptive r=0.5 @30", budget: 0.5, requestHz: options.requestHz },
         { name: "adaptive r=1 @30", budget: 1, requestHz: options.requestHz },
         { name: "adaptive r=0.5 @60", budget: 0.5, requestHz: 60 },
+        { name: `cull ${cullPixels}px fixed 30`, budget: null, requestHz: options.requestHz, cull: cullPixels },
+        { name: `cull ${cullPixels}px r=0.5 @30`, budget: 0.5, requestHz: options.requestHz, cull: cullPixels },
     ];
     const results = [];
     for (const config of configs) {
@@ -405,9 +433,9 @@ async function main() {
 
     const header = [
         "config", "req", "sorts", "reuse", "ms", "ms/s", "ms/sort",
-        "MB/s", "inv%", "vis%", "visMax%", "drift(r)", "age",
+        "MB/s", "drawn%", "inv%", "vis%", "visMax%", "drift(r)", "age",
     ];
-    const widths = [22, 5, 7, 7, 7, 7, 8, 7, 7, 7, 8, 8, 7];
+    const widths = [22, 5, 7, 7, 7, 7, 8, 7, 8, 7, 7, 8, 8, 7];
     process.stdout.write(formatRow(header, widths) + "\n");
     const rows = results.map((result) => [
         result.name,
@@ -418,6 +446,7 @@ async function main() {
         result.perSecondMs.toFixed(1),
         result.msPerSort.toFixed(2),
         (result.perSecondBytes / 1e6).toFixed(1),
+        (100 * result.drawnFraction).toFixed(1),
         (100 * result.meanInversions).toFixed(2),
         (100 * result.meanVisible).toFixed(2),
         (100 * result.maxVisible).toFixed(2),
@@ -428,6 +457,7 @@ async function main() {
 
     const baseline = results[0];
     const adaptive = results.find((result) => result.name.includes("r=0.5"));
+    const cullRow = results.find((result) => result.name.startsWith("cull"));
     const reduction = (key) =>
         (100 * (1 - adaptive[key] / baseline[key])).toFixed(0);
     process.stdout.write("\n" +
@@ -437,6 +467,13 @@ async function main() {
         `${reduction("depthBytes")}% fewer index bytes\n` +
         `strict bound saw a tightest movable gap of ` +
         `${results.find((result) => result.name.includes("r=0 @")).gapMin} keys\n`);
+    if (cullRow) {
+        process.stdout.write(
+            `a ${cullPixels} px cull draws ${(100 * cullRow.drawnFraction).toFixed(1)}% of the model: ` +
+            `${(100 * (1 - cullRow.sortMs / baseline.sortMs)).toFixed(0)}% less worker sort time, ` +
+            `${(100 * (1 - cullRow.depthBytes / baseline.depthBytes)).toFixed(0)}% fewer index bytes ` +
+            `than the same 30 Hz camera without it\n`);
+    }
 }
 
 main().catch((error) => {

@@ -502,6 +502,29 @@ function createHarness() {
             await onMessage({ data: { adaptiveSort: { enabled, budget } } });
             await settle();
         },
+        async sendLod(fraction) {
+            await onMessage({ data: { lodFraction: fraction } });
+            await settle();
+        },
+        async sendMinPixelRadius(value) {
+            await onMessage({ data: { minPixelRadius: value } });
+            await settle();
+        },
+        // A cull bound needs the focal length of the drawing buffer and the
+        // camera-space depth row.  The row is handed over as a fresh array
+        // because structured cloning gives the worker a new object on every
+        // message anyway, which is what makes a value comparison the only
+        // correct way to detect an unchanged camera.
+        async sendCullView(viewProj, focal, depthRow) {
+            await onMessage({
+                data: {
+                    view: vmFloat32(viewProj),
+                    focal,
+                    viewDepthRow: Array.from(depthRow),
+                },
+            });
+            await settle();
+        },
         reuseFrames() {
             return messages.filter((message) => message.reusedOrder);
         },
@@ -808,6 +831,92 @@ test("no network is evaluated once a model is decoded", async () => {
     );
 });
 
+// ------------------------------------------------------------------- level of detail
+
+// Every Gaussian of the fixture carries the same scale and opacity, so the LOD
+// ranking ties everywhere and the kept ids are the lowest row ids of each
+// stream.  That makes the pruned draw list exactly predictable.
+function keptIds(model, fraction) {
+    const staticIds = [];
+    const dynamicIds = [];
+    model.dynamicMask.forEach((isDynamic, id) => (isDynamic ? dynamicIds : staticIds).push(id));
+    const top = (ids) => ids.slice(0, Math.max(1, Math.round(ids.length * fraction)));
+    return [...top(staticIds), ...top(dynamicIds)];
+}
+
+test("a level keeps the top share of each stream and stays depth ordered", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+    const attributes = materializedAttributes(modelAttributes(model), model.dynamicMask);
+
+    await harness.load(model);
+    await harness.sendView(VIEW_PROJECTION);
+    assert.equal(harness.lastFrame().drawCount, model.count, "the default level draws everything");
+
+    await harness.sendLod(0.5);
+    const frame = harness.lastFrame();
+    const order = Array.from(frame.depthIndex);
+    const kept = keptIds(model, 0.5);
+
+    assert.equal(frame.drawCount, order.length, "the draw count follows the draw list");
+    assert.ok(order.length < model.count, "a level below one has to drop Gaussians");
+    assert.deepEqual(
+        [...order].sort((a, b) => a - b),
+        [...kept].sort((a, b) => a - b),
+        "a tied ranking keeps the leading share of each stream",
+    );
+    assert.deepEqual(
+        order,
+        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION).filter((id) => kept.includes(id)),
+        "the kept Gaussians stay in the reference depth order",
+    );
+
+    const split = harness.lastOf("dynamic").dynamic;
+    assert.equal(split.lodFraction, 0.5);
+    assert.equal(split.fullStaticCount + split.fullDynamicCount, model.count);
+    assert.equal(split.staticCount + split.dynamicCount, order.length);
+});
+
+test("a level asked for before the model lands is applied at decode", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+
+    await harness.sendLod(0.25);
+    await harness.load(model);
+    await harness.sendView(VIEW_PROJECTION);
+
+    const frame = harness.lastFrame();
+    assert.equal(frame.drawCount, keptIds(model, 0.25).length);
+    assert.equal(harness.lastOf("dynamic").dynamic.lodFraction, 0.25);
+});
+
+test("raising the level back restores every Gaussian", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+
+    await harness.load(model);
+    await harness.sendView(VIEW_PROJECTION);
+    await harness.sendLod(0.25);
+    assert.ok(harness.lastFrame().drawCount < model.count);
+
+    await harness.sendLod(1);
+    const frame = harness.lastFrame();
+    assert.equal(frame.drawCount, model.count, "level one must draw the whole model again");
+    assert.deepEqual(
+        Array.from(frame.depthIndex),
+        expectedOrder(
+            model.positions,
+            materializedAttributes(modelAttributes(model), model.dynamicMask),
+            0,
+            VIEW_PROJECTION,
+        ),
+        "restoring the level must restore the full reference order",
+    );
+});
+
 // ------------------------------------------------- adaptive sort scheduling
 
 // The strict scheduler decides against the tightest adjacent gap of the commit
@@ -938,4 +1047,148 @@ test("the budget admits drift the strict bound refuses", async () => {
     await assertStep(1, 5);
     assert.equal(harness.reuseFrames().length, 1, "one radius covers the drift");
     assert.equal(harness.reuseFrames()[0].dynamicRequestId, 6);
+});
+
+// --------------------------------------------------------- screen space cull
+
+// Every Gaussian of the fixture is exp(-2) world units wide on all three axes,
+// so the radius a row projects is `focal * exp(-2) / |camZ|`.  A depth row of
+// (0, 0, 1, 0) makes camZ the z coordinate: the two negative lattice levels are
+// in front of the camera while the other two - and the animated column at
+// z = 0 - sit on or behind the camera plane, where no radius is defined.  The
+// worker drops a row whose radius is below the threshold, whether or not the
+// shader's low-pass would have given it a faint blob on screen.
+const CULL_FOCAL = 100;
+const CULL_THRESHOLD = 4;
+const CULL_DEPTH_ROW = [0, 0, 1, 0];
+const CULL_MIRROR_ROW = [0, 0, -1, 0];
+const GAUSSIAN_SEMI_AXIS = Math.fround(Math.exp(-2));
+
+// The animated rows only translate along x, so a depth row that reads z makes
+// the rest positions the full story.
+function cullKeptIds(model, depthRow, threshold) {
+    return model.positions
+        .map((position, id) => {
+            const camZ = depthRow[0] * position[0] + depthRow[1] * position[1] +
+                depthRow[2] * position[2] + depthRow[3];
+            if (!(camZ < 0)) return id;
+            return CULL_FOCAL * GAUSSIAN_SEMI_AXIS / -camZ >= threshold ? id : -1;
+        })
+        .filter((id) => id >= 0);
+}
+
+test("a cull threshold drops the rows below it and keeps the camera-bound rows", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+    const attributes = materializedAttributes(modelAttributes(model), model.dynamicMask);
+
+    await harness.load(model);
+    await harness.sendMinPixelRadius(CULL_THRESHOLD);
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL, CULL_DEPTH_ROW);
+
+    const frame = harness.lastFrame();
+    const order = Array.from(frame.depthIndex);
+    const kept = cullKeptIds(model, CULL_DEPTH_ROW, CULL_THRESHOLD);
+
+    assert.ok(kept.length < model.count, "the threshold has to drop something");
+    assert.equal(frame.drawCount, kept.length, "the draw count follows the visible set");
+    assert.equal(
+        frame.sortStats.staticVisible + frame.sortStats.dynamicVisible,
+        kept.length,
+        "the report counts the visible streams",
+    );
+    assert.deepEqual(
+        [...order].sort((a, b) => a - b),
+        [...kept].sort((a, b) => a - b),
+        "only the Gaussians below the threshold may be dropped",
+    );
+    assert.deepEqual(
+        order,
+        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION)
+            .filter((id) => kept.includes(id)),
+        "the survivors keep the reference depth order",
+    );
+    // The animated column lies on the camera plane, so its rows define no
+    // radius and have to survive whatever the threshold is.
+    const dynamicIds = model.dynamicMask
+        .map((isDynamic, id) => (isDynamic ? id : -1))
+        .filter((id) => id >= 0);
+    assert.ok(
+        dynamicIds.every((id) => order.includes(id)),
+        "a Gaussian on the camera plane is never culled",
+    );
+
+    // The same threshold from the other side of the model drops the level that
+    // was visible a moment ago: the cull follows the camera, not the model.
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL, CULL_MIRROR_ROW);
+    const flipped = cullKeptIds(model, CULL_MIRROR_ROW, CULL_THRESHOLD);
+    assert.notDeepEqual(
+        [...flipped].sort((a, b) => a - b),
+        [...kept].sort((a, b) => a - b),
+        "turning the camera around has to change the visible set",
+    );
+    assert.deepEqual(
+        Array.from(harness.lastFrame().depthIndex).sort((a, b) => a - b),
+        [...flipped].sort((a, b) => a - b),
+    );
+});
+
+test("a frozen camera keeps the visible set it committed", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+    const commits = () => harness.messages.filter((message) => message.depthIndex).length;
+
+    await harness.load(model);
+    await harness.sendMinPixelRadius(CULL_THRESHOLD);
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL, CULL_DEPTH_ROW);
+    assert.equal(commits(), 1, "the first camera has to commit one order");
+    assert.equal(harness.lastFrame().sortStats.staticResorted, true);
+
+    // Every message clones the depth row, so an unchanged camera can only be
+    // recognised by comparing the values of the row.
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL, CULL_DEPTH_ROW);
+    assert.equal(commits(), 1, "an unchanged camera must not re-project the streams");
+
+    // A render scale change moves the focal length, and a wide enough footprint
+    // puts the whole model back over the threshold.
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL * 10, CULL_DEPTH_ROW);
+    assert.equal(commits(), 2, "a new focal length has to re-commit the order");
+    const frame = harness.lastFrame();
+    assert.equal(frame.sortStats.staticResorted, true);
+    assert.equal(frame.drawCount, model.count, "a wide footprint culls nothing");
+});
+
+test("a threshold set after the camera prunes and zero restores it", async () => {
+    const harness = createHarness();
+    const { positions, dynamicMask } = testFixture();
+    const model = buildModel({ positions, dynamicMask });
+    const attributes = materializedAttributes(modelAttributes(model), model.dynamicMask);
+
+    await harness.load(model);
+    await harness.sendCullView(VIEW_PROJECTION, CULL_FOCAL, CULL_DEPTH_ROW);
+    assert.equal(
+        harness.lastFrame().drawCount,
+        model.count,
+        "with the cull off the camera bound must not drop anything",
+    );
+
+    await harness.sendMinPixelRadius(CULL_THRESHOLD);
+    assert.equal(
+        harness.lastFrame().drawCount,
+        cullKeptIds(model, CULL_DEPTH_ROW, CULL_THRESHOLD).length,
+        "a threshold set after the camera must still prune",
+    );
+    assert.equal(harness.lastFrame().sortStats.staticResorted, true,
+        "a threshold change has to re-commit the order");
+
+    await harness.sendMinPixelRadius(0);
+    const restored = harness.lastFrame();
+    assert.equal(restored.drawCount, model.count, "zero must restore every Gaussian");
+    assert.deepEqual(
+        Array.from(restored.depthIndex),
+        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION),
+        "restoring the threshold must restore the reference order",
+    );
 });

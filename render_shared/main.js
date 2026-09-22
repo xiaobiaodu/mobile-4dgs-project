@@ -339,6 +339,34 @@ function createWorker(self) {
     let dynamicGate = null;     // Uint8Array: 1 for animated Gaussians
     let staticIds = null;       // Uint32Array: ids of time-invariant Gaussians
     let dynamicIds = null;      // Uint32Array: ids of animated Gaussians
+    // Level of detail.  `importance` is filled by the decoder and each stream is
+    // ranked once, so `lodFraction` can be changed at any time by taking the
+    // leading share of a ranking.  The kept ids go back into ascending row order
+    // before they reach the counting sort, which is what keeps its depth
+    // tie-break identical to the reference renderer.
+    let importance = null;      // Float32Array: view independent contribution
+    let lodFraction = 1;        // share of each stream kept for drawing
+    let lodStaticRank = null;   // static ids ordered by importance, descending
+    let lodDynamicRank = null;
+    let fullStaticIds = null;   // the split before the LOD share is taken
+    let fullDynamicIds = null;
+    let lodDirty = false;       // a level change still needs a fresh commit
+    let committedDrawCount = 0; // instances the main thread should draw
+    let cullDirty = false;      // the cull threshold or the camera moved
+    // Screen-space culling.  A Gaussian whose projected radius is below the
+    // threshold is dropped before the sort and never reaches the draw list.  The
+    // bound below uses the largest semi-axis and the larger focal length, so
+    // what is dropped is sub-pixel in every direction it covers.  It is a fill
+    // rate lever rather than an exact filter: the low-pass that the vertex
+    // shader adds to the projected covariance still spreads such a Gaussian into
+    // a faint blob, so a cull threshold dims the finest detail.
+    let focalPixels = 0;          // max(focal.x, focal.y) of the render target
+    let viewDepthRow = null;      // [0, 1, 2, 3] row of the world -> camera matrix
+    let minPixelRadius = 0;       // cull below this many pixels; 0 keeps everything
+    let visibleStaticIds = null;  // ids that survived the cull for this camera
+    let visibleDynamicIds = null;
+    let staticVisibleCount = 0;
+    let dynamicVisibleCount = 0;
     let depthKeys = null;       // Int32Array: quantized view depth per Gaussian
     let staticOrder = null;     // Uint32Array: static ids ordered by depth
     let dynamicOrder = null;    // Uint32Array: dynamic ids ordered by depth
@@ -379,6 +407,19 @@ function createWorker(self) {
         dynamicGate = null;
         staticIds = null;
         dynamicIds = null;
+        importance = null;
+        lodStaticRank = null;
+        lodDynamicRank = null;
+        fullStaticIds = null;
+        fullDynamicIds = null;
+        lodDirty = false;
+        cullDirty = false;
+        focalPixels = 0;
+        viewDepthRow = null;
+        visibleStaticIds = null;
+        visibleDynamicIds = null;
+        staticVisibleCount = 0;
+        dynamicVisibleCount = 0;
         depthKeys = null;
         staticOrder = null;
         dynamicOrder = null;
@@ -723,6 +764,13 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 [texdata_dynamic.buffer],
             );
         }
+        postSplitInfo();
+    }
+
+    // The counts the panel shows are the ones actually drawn, so this has to be
+    // re-posted when the level changes rather than only when the textures are
+    // rebuilt.
+    function postSplitInfo() {
         self.postMessage({
             dynamic: {
                 enabled: Boolean(dynamicBuffer),
@@ -730,6 +778,9 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 gated: Boolean(dynamicGate),
                 staticCount: staticIds ? staticIds.length : 0,
                 dynamicCount: dynamicIds ? dynamicIds.length : 0,
+                fullStaticCount: fullStaticIds ? fullStaticIds.length : 0,
+                fullDynamicCount: fullDynamicIds ? fullDynamicIds.length : 0,
+                lodFraction,
                 adaptiveSort: adaptiveSortEnabled,
                 adaptiveSortBudget,
             },
@@ -752,33 +803,84 @@ function contractToUnisphereInPlace(x, y, z, out) {
             buildGaussianSplit(null, hasDynamicMotion, vertexCount);
         }
         depthKeys = new Int32Array(vertexCount);
-        staticOrder = new Uint32Array(staticIds.length);
-        dynamicOrder = new Uint32Array(dynamicIds.length);
-        mergedOrder = new Uint32Array(vertexCount);
+        allocateOrderBuffers();
         sortBuckets = new Int32Array(vertexCount);
         sortCounts = new Uint32Array(256 * 256);
         sortStarts = new Uint32Array(256 * 256);
+    }
+
+    // The order buffers follow the stream sizes, so a level change resizes them,
+    // which in turn invalidates whatever the scheduler had committed.
+    function allocateOrderBuffers() {
+        const staticSize = staticIds ? staticIds.length : 0;
+        const dynamicSize = dynamicIds ? dynamicIds.length : 0;
+        // Until a camera is projected the visible set is the whole stream, which
+        // is also the fallback when culling is switched off.
+        visibleStaticIds = new Uint32Array(staticSize);
+        visibleDynamicIds = new Uint32Array(dynamicSize);
+        if (staticIds) visibleStaticIds.set(staticIds);
+        if (dynamicIds) visibleDynamicIds.set(dynamicIds);
+        staticVisibleCount = staticSize;
+        dynamicVisibleCount = dynamicSize;
+        staticOrder = new Uint32Array(staticSize);
+        dynamicOrder = new Uint32Array(dynamicSize);
+        mergedOrder = new Uint32Array(vertexCount);
         staticOrderValid = false;
         dynamicOrderValid = false;
         mergedOrderValid = false;
+        committedDepthTime = Number.NaN;
     }
 
     function projectStaticDepths(viewProj) {
         const f_buffer = new Float32Array(buffer);
+        const cull = screenSpaceCullArmed();
+        const rowX = cull ? viewDepthRow[0] : 0;
+        const rowY = cull ? viewDepthRow[1] : 0;
+        const rowZ = cull ? viewDepthRow[2] : 0;
+        const rowW = cull ? viewDepthRow[3] : 0;
+        const cullFocal = focalPixels;
+        const cullThreshold = minPixelRadius;
+        let count = 0;
         for (let n = 0; n < staticIds.length; n++) {
             const i = staticIds[n];
-            depthKeys[i] = quantizeDepth(
-                viewProj,
-                f_buffer[8 * i + 0],
-                f_buffer[8 * i + 1],
-                f_buffer[8 * i + 2],
-            );
+            const x = f_buffer[8 * i + 0];
+            const y = f_buffer[8 * i + 1];
+            const z = f_buffer[8 * i + 2];
+            depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            // A row on or behind the camera plane has no radius to bound, so
+            // the vertex shader's clip test is what decides it.
+            let keep = true;
+            if (cull) {
+                const camZ = rowX * x + rowY * y + rowZ * z + rowW;
+                keep = !(camZ < 0);
+                if (!keep) {
+                    const sx = f_buffer[8 * i + 3];
+                    const sy = f_buffer[8 * i + 4];
+                    const sz = f_buffer[8 * i + 5];
+                    const semiAxis = sx > sy
+                        ? (sx > sz ? sx : sz)
+                        : (sy > sz ? sy : sz);
+                    keep = cullFocal * semiAxis >= cullThreshold * -camZ;
+                }
+            }
+            if (keep) {
+                visibleStaticIds[count++] = i;
+            }
         }
+        return count;
     }
 
     function projectDynamicDepths(viewProj) {
         const f_buffer = new Float32Array(buffer);
         const hasDynamicMotion = Boolean(dynamicBuffer) && dynamicBuffer.length === vertexCount * 8;
+        const cull = screenSpaceCullArmed();
+        const rowX = cull ? viewDepthRow[0] : 0;
+        const rowY = cull ? viewDepthRow[1] : 0;
+        const rowZ = cull ? viewDepthRow[2] : 0;
+        const rowW = cull ? viewDepthRow[3] : 0;
+        const cullFocal = focalPixels;
+        const cullThreshold = minPixelRadius;
+        let count = 0;
         for (let n = 0; n < dynamicIds.length; n++) {
             const i = dynamicIds[n];
             let x = f_buffer[8 * i + 0];
@@ -793,8 +895,45 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
             }
             depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            // A row on or behind the camera plane has no radius to bound, so
+            // the vertex shader's clip test is what decides it.
+            let keep = true;
+            if (cull) {
+                const camZ = rowX * x + rowY * y + rowZ * z + rowW;
+                keep = !(camZ < 0);
+                if (!keep) {
+                    const sx = f_buffer[8 * i + 3];
+                    const sy = f_buffer[8 * i + 4];
+                    const sz = f_buffer[8 * i + 5];
+                    const semiAxis = sx > sy
+                        ? (sx > sz ? sx : sz)
+                        : (sy > sz ? sy : sz);
+                    keep = cullFocal * semiAxis >= cullThreshold * -camZ;
+                }
+            }
+            if (keep) {
+                visibleDynamicIds[count++] = i;
+            }
         }
+        return count;
     }
+
+    // Whether the two projection passes above have to test a footprint at all.
+    // A Gaussian survives when its projected radius reaches the threshold,
+    // `focal * max(semiAxis) / -camZ >= threshold`, which the loops rearrange
+    // into a multiplication because they run once per Gaussian of a stream.  The
+    // largest semi-axis bounds the whole footprint and the larger focal length
+    // keeps the bound conservative, so nothing wider than the threshold is ever
+    // dropped.  A row on or behind the camera plane projects no radius at all,
+    // so it is never culled and the vertex shader's clip test keeps deciding it.
+    //
+    // The test is inlined and the row, the focal length and the threshold are
+    // copied into locals once per pass, because this is the hot path of a
+    // projection: on tools/adaptive_sort_bench.js a helper call per Gaussian made
+    // the pass about half again as slow, which is more than a cull of this size
+    // can save.
+    const screenSpaceCullArmed = () =>
+        minPixelRadius > 0 && focalPixels > 0 && Boolean(viewDepthRow);
 
     // 16 bit single-pass counting sort over one stream.  `ids` is in ascending
     // Gaussian order, so Gaussians sharing a depth bucket stay ordered by their
@@ -828,9 +967,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
     // Merge the two depth-ordered streams into a single draw order, breaking
     // depth ties by the original Gaussian row id, exactly like the reference
     // static cache does.
-    function mergeStreams() {
-        const staticCount = staticOrder.length;
-        const dynamicCount = dynamicOrder.length;
+    function mergeStreams(staticCount, dynamicCount) {
         let s = 0;
         let d = 0;
         let out = 0;
@@ -991,9 +1128,14 @@ function contractToUnisphereInPlace(x, y, z, out) {
         if (lastVertexCount != vertexCount) {
             generateTexture();
             lastVertexCount = vertexCount;
-        } else if (!viewChanged && !dynamicTimeChanged && !pendingDynamicFrame) {
+        } else if (!viewChanged && !dynamicTimeChanged && !pendingDynamicFrame &&
+            !lodDirty && !cullDirty) {
             return;
         }
+        // Consumed here: the guard above is the only place that can skip them,
+        // and a level or cull change must always reach a fresh commit.
+        lodDirty = false;
+        cullDirty = false;
 
         // A playback frame that only advances time may keep the committed draw
         // order: when the animated rows are provably too slow to close any
@@ -1009,6 +1151,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 dynamicRequestId: request.requestId,
                 dynamicTime: request.time,
                 vertexCount,
+                drawCount: committedDrawCount,
             });
             return;
         }
@@ -1020,14 +1163,20 @@ function contractToUnisphereInPlace(x, y, z, out) {
         if (staticResorted) {
             // The static stream never moves, so a fixed camera keeps its
             // projection and sort until the view direction actually changes.
-            projectStaticDepths(viewProj);
-            sortStream(staticIds, staticOrder);
+            staticVisibleCount = projectStaticDepths(viewProj);
+            sortStream(
+                visibleStaticIds.subarray(0, staticVisibleCount),
+                staticOrder.subarray(0, staticVisibleCount),
+            );
             staticOrderValid = true;
             streamsChanged = true;
         }
         if (dynamicResorted) {
-            projectDynamicDepths(viewProj);
-            sortStream(dynamicIds, dynamicOrder);
+            dynamicVisibleCount = projectDynamicDepths(viewProj);
+            sortStream(
+                visibleDynamicIds.subarray(0, dynamicVisibleCount),
+                dynamicOrder.subarray(0, dynamicVisibleCount),
+            );
             dynamicOrderValid = true;
             streamsChanged = true;
         }
@@ -1035,17 +1184,24 @@ function contractToUnisphereInPlace(x, y, z, out) {
         // merging would only add a redundant pass over every Gaussian.  A
         // legacy export without gate metadata is exactly that case, and it
         // must not become slower than the pre-separation sort.
-        const needsMerge = staticIds.length > 0 && dynamicIds.length > 0;
+        const needsMerge = staticVisibleCount > 0 && dynamicVisibleCount > 0;
         if (streamsChanged || !mergedOrderValid) {
-            if (needsMerge) mergeStreams();
+            if (needsMerge) mergeStreams(staticVisibleCount, dynamicVisibleCount);
             mergedOrderValid = true;
         }
 
         lastProj = viewProj;
         lastDynamicSortTime = hasDynamicMotion ? dynamicTime : Number.NaN;
+        // The merged buffer is sized for the whole model, so the draw order is
+        // handed over as the leading slice that the current level actually
+        // keeps.  A pruned level therefore draws fewer instances without any
+        // change to the vertex buffers or the index format.
         const drawOrder = needsMerge
-            ? mergedOrder
-            : (staticIds.length > 0 ? staticOrder : dynamicOrder);
+            ? mergedOrder.subarray(0, staticVisibleCount + dynamicVisibleCount)
+            : (staticVisibleCount > 0
+                ? staticOrder.subarray(0, staticVisibleCount)
+                : dynamicOrder.subarray(0, dynamicVisibleCount));
+        committedDrawCount = drawOrder.length;
         if (adaptiveSortEnabled && hasDynamicMotion) {
             // The cached order is committed at this time, and the gap histogram
             // tells the next playback frame how much movement it can absorb.
@@ -1064,12 +1220,16 @@ function contractToUnisphereInPlace(x, y, z, out) {
             depthIndex: drawOrder,
             viewProj,
             vertexCount,
+            drawCount: committedDrawCount,
             sortStats: {
                 staticPoints: staticIds.length,
                 dynamicPoints: dynamicIds.length,
                 staticResorted,
                 dynamicResorted,
                 merged: needsMerge,
+                // What survived the cull for the camera this order belongs to.
+                staticVisible: staticVisibleCount,
+                dynamicVisible: dynamicVisibleCount,
                 adaptive: adaptiveSortEnabled,
                 // What the scheduler measured when it committed this order: the
                 // tightest movable depth gap of the draw list, how fast the
@@ -1423,14 +1583,98 @@ function contractToUnisphereInPlace(x, y, z, out) {
         animatedFlags = animated;
         let dynamicCount = 0;
         for (let i = 0; i < pointCount; i++) dynamicCount += animated[i];
-        staticIds = new Uint32Array(pointCount - dynamicCount);
-        dynamicIds = new Uint32Array(dynamicCount);
+        fullStaticIds = new Uint32Array(pointCount - dynamicCount);
+        fullDynamicIds = new Uint32Array(dynamicCount);
         let staticIndex = 0;
         let dynamicIndex = 0;
         for (let i = 0; i < pointCount; i++) {
-            if (animated[i]) dynamicIds[dynamicIndex++] = i;
-            else staticIds[staticIndex++] = i;
+            if (animated[i]) fullDynamicIds[dynamicIndex++] = i;
+            else fullStaticIds[staticIndex++] = i;
         }
+        lodStaticRank = importance ? rankByImportance(fullStaticIds) : null;
+        lodDynamicRank = importance ? rankByImportance(fullDynamicIds) : null;
+        applyLodFraction();
+    }
+
+    // Order one stream by the contribution the decoder measured, so the leading
+    // share of the result is the part a viewer notices first.  Ties fall back to
+    // the row id to keep the ranking stable across reloads.
+    function rankByImportance(ids) {
+        const ranked = Uint32Array.from(ids);
+        const values = importance;
+        ranked.sort((a, b) => values[b] - values[a] || a - b);
+        return ranked;
+    }
+
+    // The kept ids of a level, back in ascending row order.  With no ranking
+    // (a buffer that did not come from the decoder) the whole stream is used,
+    // which is the behaviour before LOD existed.
+    function selectTopFraction(rank, full, fraction) {
+        if (!rank) return Uint32Array.from(full || []);
+        if (fraction >= 1) return Uint32Array.from(rank);
+        const keep = Math.max(1, Math.round(rank.length * fraction));
+        return rank.slice(0, keep).sort();
+    }
+
+    function applyLodFraction() {
+        staticIds = selectTopFraction(lodStaticRank, fullStaticIds, lodFraction);
+        dynamicIds = selectTopFraction(lodDynamicRank, fullDynamicIds, lodFraction);
+        allocateOrderBuffers();
+    }
+
+    function buildLodRanks() {
+        lodStaticRank = importance ? rankByImportance(fullStaticIds) : null;
+        lodDynamicRank = importance ? rankByImportance(fullDynamicIds) : null;
+    }
+
+    // Change the level at any time: the streams are re-filtered, the scheduler's
+    // committed order is dropped, and the next sort commits a fresh draw list.
+    function setLodFraction(value) {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next <= 0 || next > 1) {
+            console.warn("LOD fraction must be a share in (0, 1]; got", value);
+            return lodFraction;
+        }
+        lodFraction = next;
+        if (!fullStaticIds && !fullDynamicIds) {
+            // No model yet: the decoder applies the requested level as soon as
+            // it has the ranking.
+            return lodFraction;
+        }
+        if (!importance) {
+            // A buffer that did not come from the decoder has no ranking, so
+            // the whole model stays at level one.
+            console.warn("This model has no LOD ranking; keeping every Gaussian.");
+            return lodFraction;
+        }
+        applyLodFraction();
+        refreshAdaptiveMotionBounds();
+        lodDirty = true;
+        postSplitInfo();
+        throttledSort();
+        return lodFraction;
+    }
+
+    // Change the cull threshold at any time.  The visible set is a property of
+    // the camera rather than of the model, so the streams have to be projected
+    // again even when the view direction did not move.
+    function setMinPixelRadius(value) {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next < 0) {
+            console.warn("minPixelRadius must be zero or more; got", value);
+            return minPixelRadius;
+        }
+        minPixelRadius = next;
+        invalidateCull();
+        throttledSort();
+        return minPixelRadius;
+    }
+
+    function invalidateCull() {
+        cullDirty = true;
+        staticOrderValid = false;
+        dynamicOrderValid = false;
+        mergedOrderValid = false;
     }
 
 
@@ -1765,6 +2009,7 @@ function contractToUnisphere(x, y, z) {
         console.log("RAW App Point 0:", appearance[0], appearance[1], appearance[2]);
 
         const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+        importance = new Float32Array(vertexCount);
         console.time("Neural Decode Loop");
         const progressStep = Math.max(1, Math.floor(vertexCount / 80));
         for (let i = 0; i < vertexCount; i++) {
@@ -1902,6 +2147,10 @@ function contractToUnisphere(x, y, z) {
             f_buffer[8 * i + 1] = y;
             f_buffer[8 * i + 2] = z;
 
+            // View independent contribution proxy for the LOD ranking: opacity
+            // gates how much a Gaussian can darken a pixel and the geometric
+            // mean of its scales how many pixels it can reach.
+            importance[i] = act_opacity * Math.cbrt(act_scale_x * act_scale_y * act_scale_z);
             f_buffer[8 * i + 3] = act_scale_x;
             f_buffer[8 * i + 4] = act_scale_y;
             f_buffer[8 * i + 5] = act_scale_z;
@@ -1951,6 +2200,10 @@ function contractToUnisphere(x, y, z) {
      
         console.timeEnd("Neural Decode Loop");
         reportProgress("decompose", 95);
+        // Every Gaussian has an importance now, so the per stream rankings can
+        // be built and the requested level applied.
+        buildLodRanks();
+        applyLodFraction();
         // The decoder has written every scale by now, so the scheduler knows how
         // large a Gaussian footprint is on the depth axis.
         refreshAdaptiveScale();
@@ -1980,6 +2233,13 @@ function contractToUnisphere(x, y, z) {
             buffer = e.data.buffer;
             vertexCount = e.data.vertexCount;
             covarianceBuffer = null;
+            // A buffer that did not come from the decoder carries no ranking, so
+            // the level falls back to one instead of reusing another model's.
+            importance = null;
+            lodStaticRank = null;
+            lodDynamicRank = null;
+            fullStaticIds = null;
+            fullDynamicIds = null;
         } else if (e.data.adaptiveSort) {
             // The scheduling policy is a viewer setting rather than a model
             // property, so it can arrive before or after a model is decoded.
@@ -1991,9 +2251,37 @@ function contractToUnisphere(x, y, z) {
             committedDepthTime = Number.NaN;
             mergedOrderValid = false;
             refreshAdaptiveMotionBounds();
+        } else if (Number.isFinite(e.data.lodFraction)) {
+            // A level is a viewer setting, and the ranking is already built, so
+            // it can be changed long after the model was decoded.
+            setLodFraction(e.data.lodFraction);
         } else if (e.data.view) {
             viewProj = e.data.view;
+            // The cull bound depends on the focal length and the camera, so a
+            // resize or a render scale change has to re-project the streams even
+            // when the view direction itself did not move.
+            const focal = Number(e.data.focal);
+            const depthRow = e.data.viewDepthRow;
+            const focalMoved = Number.isFinite(focal) && focal !== focalPixels;
+            // Structured cloning hands the worker a fresh array on every
+            // message, so the row can only be compared by value.  Comparing it
+            // is what lets a frozen camera keep the visible set it committed.
+            const rowMoved = depthRow != null && depthRow.length >= 4 &&
+                (!viewDepthRow ||
+                    depthRow[0] !== viewDepthRow[0] ||
+                    depthRow[1] !== viewDepthRow[1] ||
+                    depthRow[2] !== viewDepthRow[2] ||
+                    depthRow[3] !== viewDepthRow[3]);
+            if (focalMoved || rowMoved) {
+                if (focalMoved) focalPixels = focal;
+                if (rowMoved) viewDepthRow = depthRow;
+                invalidateCull();
+            }
             throttledSort();
+        } else if (Number.isFinite(e.data.minPixelRadius)) {
+            // A threshold is a viewer setting, so it can arrive before or after
+            // a model is decoded.
+            setMinPixelRadius(e.data.minPixelRadius);
         } else if (Number.isFinite(e.data.time)) {
             if (dynamicBuffer) {
                 const nextTime = e.data.time;
@@ -2312,6 +2600,32 @@ async function main() {
         }, 200);
     };
 
+    // The split label is composed from the decode report and the counts of the
+    // last committed draw list, because the cull only shows its effect once a
+    // camera has been projected.
+    let splitCounts = null;
+    let cullStats = null;
+    const updateSplitInfo = () => {
+        const splitInfo = document.getElementById("split-info");
+        if (!splitInfo) return;
+        if (!splitCounts ||
+            !(splitCounts.staticCount + splitCounts.dynamicCount > 0)) {
+            splitInfo.innerText = "";
+            return;
+        }
+        let text = splitCounts.staticCount.toLocaleString() + " static / " +
+            splitCounts.dynamicCount.toLocaleString() + " dynamic";
+        if (Number.isFinite(splitCounts.lodFraction) && splitCounts.lodFraction < 1) {
+            text += " (LOD " + splitCounts.lodFraction + ")";
+        }
+        if (minPixelRadius > 0 && cullStats) {
+            const kept = cullStats.staticVisible + cullStats.dynamicVisible;
+            const total = splitCounts.staticCount + splitCounts.dynamicCount;
+            text += " (cull " + kept.toLocaleString() + "/" + total.toLocaleString() + ")";
+        }
+        splitInfo.innerText = text;
+    };
+
     showProgress(0);
     const params = new URLSearchParams(location.search);
     const viewerConfig = window.FLUX_GS_CONFIG || {};
@@ -2378,6 +2692,30 @@ async function main() {
         configuredRenderScale > 0 && configuredRenderScale <= 2
         ? configuredRenderScale
         : 1;
+    // Level of detail.  The decoder ranks every stream by contribution, so this
+    // is the share of each stream that reaches the draw list; the rest is
+    // dropped once, at load, and never sorted or rasterised again.  One keeps
+    // the whole model.
+    const configuredLodFraction = Number(
+        params.get("lod") ?? viewerConfig.lodFraction ?? 1,
+    );
+    const lodFraction = Number.isFinite(configuredLodFraction) &&
+        configuredLodFraction > 0 && configuredLodFraction <= 1
+        ? configuredLodFraction
+        : 1;
+    // Screen space cull.  The worker drops every Gaussian whose projected radius
+    // is below this many pixels from the draw list instead of letting it
+    // rasterise.  It is a fill rate lever rather than a lossless filter: the
+    // vertex shader's low-pass spreads a sub-pixel Gaussian into a faint blob,
+    // so a threshold dims the finest detail.  Zero keeps every Gaussian, which
+    // is what the viewer did before the knob existed.
+    const configuredMinPixelRadius = Number(
+        params.get("minPixelRadius") ?? viewerConfig.minPixelRadius ?? 0,
+    );
+    let minPixelRadius = Number.isFinite(configuredMinPixelRadius) &&
+        configuredMinPixelRadius > 0
+        ? configuredMinPixelRadius
+        : 0;
     const dynamicAutoplayParam = params.get("dynamicAutoplay");
     const initialDynamicPlayback = dynamicAutoplayParam === null
         ? viewerConfig.dynamicAutoplay !== false
@@ -2482,6 +2820,8 @@ async function main() {
             budget: adaptiveSortBudget,
         },
     });
+    worker.postMessage({ lodFraction });
+    worker.postMessage({ minPixelRadius });
     // const worker = new Worker(
     //     URL.createObjectURL(
     //         new Blob(["(", createWorker.toString(), ")(self)"], {
@@ -2600,6 +2940,19 @@ async function main() {
     gl.vertexAttribIPointer(a_index, 1, gl.INT, false, 0, 0);
     gl.vertexAttribDivisor(a_index, 1);
 
+    // The label mirrors the drawing buffer and both throughput knobs, so it is
+    // rebuilt whenever any of them changes rather than only on a resize.
+    let lastRenderWidth = 1;
+    let lastRenderHeight = 1;
+    let renderFocalPixels = 0;  // max(focal.x, focal.y) of the drawing buffer
+    const updateRenderSizeLabel = () => {
+        if (!renderSizeLabel) return;
+        let text = lastRenderWidth + "x" + lastRenderHeight;
+        if (renderScale !== 1) text += " @" + renderScale + "x";
+        if (minPixelRadius > 0) text += " r>=" + minPixelRadius + "px";
+        renderSizeLabel.innerText = text;
+    };
+
     const resize = () => {
         const renderWidth = Math.max(1, Math.round((innerWidth / downsample) * renderScale));
         const renderHeight = Math.max(1, Math.round((innerHeight / downsample) * renderScale));
@@ -2614,6 +2967,8 @@ async function main() {
         // training image have identical dimensions.
         const focalX = renderWidth * Number(camera.fx) / Number(camera.width);
         const focalY = renderHeight * Number(camera.fy) / Number(camera.height);
+        // The cull bound is conservative, so it takes the larger focal length.
+        renderFocalPixels = Math.max(focalX, focalY);
         gl.uniform2fv(u_focal, new Float32Array([focalX, focalY]));
         gl.uniform2fv(u_viewport, new Float32Array([renderWidth, renderHeight]));
 
@@ -2624,10 +2979,9 @@ async function main() {
             renderHeight,
         );
         gl.uniformMatrix4fv(u_projection, false, projectionMatrix);
-        if (renderSizeLabel) {
-            renderSizeLabel.innerText = renderWidth + "x" + renderHeight +
-                (renderScale === 1 ? "" : " @" + renderScale + "x");
-        }
+        lastRenderWidth = renderWidth;
+        lastRenderHeight = renderHeight;
+        updateRenderSizeLabel();
     };
 
     window.addEventListener("resize", resize);
@@ -2644,6 +2998,31 @@ async function main() {
         renderScale = next;
         resize();
         return renderScale;
+    };
+    // The level is a viewer setting rather than a model property, so it is
+    // asked for through the worker, which re-filters the streams and commits a
+    // fresh draw list for the level that is already loaded.
+    window.setLodFraction = (value) => {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next <= 0 || next > 1) {
+            console.warn("setLodFraction expects a share in (0, 1]; got", value);
+            return;
+        }
+        worker.postMessage({ lodFraction: next });
+    };
+    // The threshold is a viewer setting rather than a model property, so it is
+    // asked for through the worker, which re-projects the visible set for the
+    // camera that is already committed.
+    window.setMinPixelRadius = (value) => {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next < 0) {
+            console.warn("setMinPixelRadius expects zero or more pixels; got", value);
+            return minPixelRadius;
+        }
+        minPixelRadius = next;
+        worker.postMessage({ minPixelRadius: next });
+        updateRenderSizeLabel();
+        return minPixelRadius;
     };
 
     const dynamicControls = document.getElementById("dynamic-controls");
@@ -2884,14 +3263,14 @@ async function main() {
             }
             gl.uniform1i(u_dynamicEnabled, dynamicScene ? 1 : 0);
             const split = e.data.dynamic;
-            const splitInfo = document.getElementById("split-info");
-            if (splitInfo) {
-                splitInfo.innerText = Number.isFinite(split.staticCount) &&
-                    split.staticCount + split.dynamicCount > 0
-                    ? `${split.staticCount.toLocaleString()} static / ` +
-                        `${split.dynamicCount.toLocaleString()} dynamic`
-                    : "";
-            }
+            splitCounts = {
+                staticCount: split.staticCount,
+                dynamicCount: split.dynamicCount,
+                lodFraction: split.lodFraction,
+            };
+            // A fresh model invalidates whatever the previous camera culled.
+            cullStats = null;
+            updateSplitInfo();
             const syncedInitialCameraTime =
                 dynamicScene &&
                 !hasConfiguredInitialDynamicTime &&
@@ -2929,6 +3308,20 @@ async function main() {
                 gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             }
             vertexCount = e.data.vertexCount;
+            // A reused order carries the count of the last commit, because it
+            // deliberately sends no index buffer.
+            drawCount = Number.isFinite(e.data.drawCount)
+                ? e.data.drawCount
+                : (depthIndex ? depthIndex.length : drawCount);
+            const stats = e.data.sortStats;
+            if (stats && Number.isFinite(stats.staticVisible) &&
+                Number.isFinite(stats.dynamicVisible)) {
+                cullStats = {
+                    staticVisible: stats.staticVisible,
+                    dynamicVisible: stats.dynamicVisible,
+                };
+                updateSplitInfo();
+            }
             if (isDynamicFrame) {
                 // The default path commits all dynamic state atomically. A
                 // smooth-playback scene advances motion in the vertex shader
@@ -3218,6 +3611,9 @@ async function main() {
 
     let jumpDelta = 0;
     let vertexCount = 0;
+    // Instances the committed draw list actually contains.  A level that prunes
+    // the model only shrinks this, so the vertex buffers never change.
+    let drawCount = 0;
 
     let fpsWindowStart = null;
     let fpsFrameCount = 0;
@@ -3438,9 +3834,22 @@ async function main() {
         gl.uniform3fv(u_camPos, cameraPos);
 
         const viewProj = multiply4(projectionMatrix, actualViewMatrix);
-        worker.postMessage({ view: viewProj });
+        // The worker culls on the projected radius, so it needs the focal length
+        // of the drawing buffer and the camera-space depth row.  The depth row is
+        // row 2 of a column-major world -> camera matrix, and every matrix that
+        // reaches this point is affine, so that one row is the whole depth axis.
+        worker.postMessage({
+            view: viewProj,
+            focal: renderFocalPixels,
+            viewDepthRow: [
+                actualViewMatrix[2],
+                actualViewMatrix[6],
+                actualViewMatrix[10],
+                actualViewMatrix[14],
+            ],
+        });
 
-        if (vertexCount > 0) {
+        if (drawCount > 0) {
             document.getElementById("spinner").style.display = "none";
             gl.uniformMatrix4fv(u_view, false, actualViewMatrix);
             gl.clear(gl.COLOR_BUFFER_BIT);
@@ -3459,7 +3868,7 @@ async function main() {
                 }
             }
 
-            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, vertexCount);
+            gl.drawArraysInstanced(gl.TRIANGLE_FAN, 0, 4, drawCount);
 
             if (debugWebGL) {
                 const drawError = gl.getError();

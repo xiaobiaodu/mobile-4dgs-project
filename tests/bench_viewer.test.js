@@ -59,6 +59,14 @@ test("config parses typed query values and clamps what is out of range", () => {
     assert.equal(M.parseConfig("?renderScale=0.5").renderScale, 0.5);
     assert.equal(M.parseConfig("?renderScale=0").renderScale, 1, "zero is not a scale");
     assert.equal(M.parseConfig("?renderScale=5").renderScale, 1, "above 2 would upscale");
+    assert.equal(M.parseConfig("?lod=0.5").lod, 0.5);
+    assert.equal(M.parseConfig("?lod=0").lod, 1, "zero is not a share");
+    assert.equal(M.parseConfig("?lod=2").lod, 1, "a level above one cannot add Gaussians");
+    assert.equal(M.parseConfig("?minPixelRadius=2").minPixelRadius, 2);
+    assert.equal(M.parseConfig("?minPixelRadius=0").minPixelRadius, 0,
+        "zero is the cull being off");
+    assert.equal(M.parseConfig("?minPixelRadius=-3").minPixelRadius, 0,
+        "a negative radius would cull everything");
 });
 
 test("configToSearch omits defaults and round trips", () => {

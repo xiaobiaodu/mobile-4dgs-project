@@ -24,6 +24,8 @@
         adaptiveSort: config.adaptive === 1,
         adaptiveSortBudget: config.adaptive === 1 ? config.budget : 0,
         renderScale: config.renderScale,
+        lodFraction: config.lod,
+        minPixelRadius: config.minPixelRadius,
         dynamicAutoplay: true,
     };
     if (config.camera) window.FLUX_GS_CONFIG.cameraUrl = config.camera;
@@ -398,6 +400,8 @@
             loopSeconds: config.loop,
             renderSize: renderSize(),
             renderScale: config.renderScale,
+            lod: config.lod,
+            minPixelRadius: config.minPixelRadius,
             dpr: window.devicePixelRatio,
             glRenderer: glRenderer(),
             hardwareConcurrency: navigator.hardwareConcurrency || "",
@@ -559,6 +563,8 @@
         { key: "budget", label: "budget r", values: [["0", "0 exact"], ["0.25", "0.25"], ["0.5", "0.5"], ["1", "1"], ["2", "2"]] },
         { key: "sortFps", label: "sort Hz", values: [["0", "uncapped"], ["10", "10"], ["30", "30"], ["60", "60"]] },
         { key: "renderScale", label: "render scale", values: [["1", "1 (full)"], ["0.75", "0.75"], ["0.5", "0.5"], ["0.35", "0.35"], ["0.25", "0.25"]] },
+        { key: "lod", label: "lod", values: [["1", "1 (all)"], ["0.75", "0.75"], ["0.5", "0.5"], ["0.35", "0.35"], ["0.25", "0.25"], ["0.1", "0.1"]] },
+        { key: "minPixelRadius", label: "cull px", values: [["0", "off"], ["1", "1"], ["2", "2"], ["4", "4"]] },
         { key: "sec", label: "measure s", values: [["5", "5"], ["10", "10"], ["20", "20"], ["30", "30"]] },
         { key: "warm", label: "warmup s", values: [["2", "2"], ["3", "3"], ["5", "5"]] },
         { key: "model", label: "model", values: [["coffee.json", "coffee"], ["salmon.json", "salmon"], ["flame_steak.json", "steak"], ["garden.json", "garden (static)"]] },
@@ -631,6 +637,9 @@
         ];
         if (Number.isFinite(scene.staticCount) && Number.isFinite(scene.dynamicCount)) {
             parts.push(scene.staticCount + " static / " + scene.dynamicCount + " dynamic");
+        }
+        if (config.minPixelRadius > 0) {
+            parts.push("cull < " + config.minPixelRadius + " px");
         }
         const warnings = [];
         if (config.sweep === 1) {
