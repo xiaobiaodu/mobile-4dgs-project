@@ -6,5 +6,4 @@ window.FLUX_GS_CONFIG = {
     dynamicLoopSeconds: 1200/30/4,
     dynamicSortFps: 10,
     smoothDynamicPlayback: true,
-    dynamicShDuringPlayback: false,
 };

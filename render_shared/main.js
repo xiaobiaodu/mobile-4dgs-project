@@ -1,3 +1,10 @@
+// Subresources are resolved against this script rather than against the page,
+// so a viewer page works at any directory depth.  main.js is a classic script,
+// so document.currentScript is this file for the whole of its own execution.
+const MAIN_SCRIPT_URL = document.currentScript
+    ? document.currentScript.src
+    : window.location.href;
+
 let cameras = [
     {
         id: 0,
@@ -307,7 +314,6 @@ function createWorker(self) {
     // IJKL - quaternion/rot (uint8)
     const rowLength = 3 * 4 + 3 * 4 + 4 + 4; // 32 bytes per vertex
     let lastProj = [];
-    let depthIndex = new Uint32Array();
     let lastVertexCount = 0;
     let sortRunning;
     // Dynamic scenes store the FreeTimeGS parameters in this layout per point:
@@ -319,11 +325,80 @@ function createWorker(self) {
     // 32-byte splat buffer stores rotation as uint8, which is not precise
     // enough to rebuild thin anisotropic Gaussians faithfully.
     let covarianceBuffer = null;
-    let dynamicShState = null;
     let dynamicTime = 0;
     let lastDynamicSortTime = Number.NaN;
     let pendingDynamicFrame = null;
     const DYNAMIC_TEX_WIDTH = 2048;
+
+    // Static/dynamic separation.  Mobile-GS2 commits a hard per-Gaussian gate:
+    // gate=1 rows follow the FreeTimeGS trajectory, gate=0 rows are exactly
+    // time invariant.  Loading those two streams separately lets a fixed camera
+    // keep the static projection and depth sort between frames, so playback only
+    // has to re-project and re-sort the (usually much smaller) dynamic stream and
+    // merge it back into a single depth-ordered draw list.
+    let dynamicGate = null;     // Uint8Array: 1 for animated Gaussians
+    let staticIds = null;       // Uint32Array: ids of time-invariant Gaussians
+    let dynamicIds = null;      // Uint32Array: ids of animated Gaussians
+    let depthKeys = null;       // Int32Array: quantized view depth per Gaussian
+    let staticOrder = null;     // Uint32Array: static ids ordered by depth
+    let dynamicOrder = null;    // Uint32Array: dynamic ids ordered by depth
+    let mergedOrder = null;     // Uint32Array: single depth-ordered draw list
+    let sortBuckets = null;     // Int32Array scratch for the counting sort
+    let sortCounts = null;      // Uint32Array(65536) scratch: bucket sizes
+    let sortStarts = null;      // Uint32Array(65536) scratch: bucket offsets
+    let staticOrderValid = false;
+    let dynamicOrderValid = false;
+    let mergedOrderValid = false;
+
+    // Adaptive, error-bounded sort scheduling.  The committed draw order stays
+    // valid while the animated rows cannot move far enough to close the depth
+    // gap of a neighbouring pair, so a playback frame can reuse it instead of
+    // re-projecting, re-sorting, re-merging and re-uploading the index buffer.
+    //
+    // Two policies share the same movement bound.  A budget of zero is the exact
+    // policy: the order is reused only when no pair can even reach a tie, which
+    // needs one pass over the draw list to measure the tightest movable depth
+    // gap.  A positive budget is the tolerance policy: the order may drift, but
+    // by less than that many mean Gaussian radii, so a swap can only exchange
+    // rows that already overlap on screen.  It decides from the movement bound
+    // alone and never pays for the gap measurement.
+    const DEPTH_KEY_SCALE = 4096;      // must match quantizeDepth
+    let adaptiveSortEnabled = false;
+    let adaptiveSortBudget = 0;            // allowed drift, in Gaussian radii
+    let committedDepthTime = Number.NaN;   // time the cached order belongs to
+    let depthGapMin = 0;                   // smallest movable adjacent depth gap
+    let animatedFlags = null;              // Uint8Array: 1 for animated rows
+    let viewDepthRowNorm = 0;              // |depth row| of the sorted view
+    let motionMeanScale = 0;               // mean Gaussian radius of the model
+    let dynamicSpeedBound = 0;             // max |velocity| over animated rows
+    let dynamicAccelBound = 0;             // max |acceleration| over animated rows
+    let canonicalTimeMin = 0;
+    let canonicalTimeMax = 0;
+
+    function resetSortState() {
+        dynamicGate = null;
+        staticIds = null;
+        dynamicIds = null;
+        depthKeys = null;
+        staticOrder = null;
+        dynamicOrder = null;
+        mergedOrder = null;
+        sortBuckets = null;
+        sortCounts = null;
+        sortStarts = null;
+        committedDepthTime = Number.NaN;
+        depthGapMin = 0;
+        animatedFlags = null;
+        viewDepthRowNorm = 0;
+        motionMeanScale = 0;
+        dynamicSpeedBound = 0;
+        dynamicAccelBound = 0;
+        canonicalTimeMin = 0;
+        canonicalTimeMax = 0;
+        staticOrderValid = false;
+        dynamicOrderValid = false;
+        mergedOrderValid = false;
+    }
 
     let tmc3Module = null;
     let pendingMobileGS = null;
@@ -480,67 +555,6 @@ function contractToUnisphereInPlace(x, y, z, out) {
         const texdata_sh = new Float32Array(texwidth_sh * texheight_sh * 4);
         texdata_sh.set(new Float32Array(shBuffer));
         return { texdata_sh, texwidth_sh, texheight_sh };
-    }
-
-    function updateDynamicShBuffer(time) {
-        if (!dynamicShState || !dynamicBuffer || !buffer || !shBuffer) return false;
-        if (Number.isFinite(dynamicShState.lastTime) &&
-            Math.abs(dynamicShState.lastTime - time) <= 1e-6) {
-            return false;
-        }
-
-        const f_buffer = new Float32Array(buffer);
-        const sh_f_buffer = new Float32Array(shBuffer);
-        const {
-            baseShs,
-            offsetInput,
-            mlpOffset,
-        } = dynamicShState;
-        const feat1 = new Float32Array(mlpOffset['main.0.bias'].length);
-        const feat2 = new Float32Array(mlpOffset['main.2.bias'].length);
-        const feat3 = new Float32Array(mlpOffset['main.4.bias'].length);
-        const sh_offset = new Float32Array(mlpOffset['shs_output.0.bias'].length);
-        const shsnn_input = new Float32Array(23);
-        const finalShs = new Float32Array(12);
-
-        for (let i = 0; i < vertexCount; i++) {
-            const inputOffset = i * 20;
-            for (let j = 0; j < 16; j++) {
-                shsnn_input[j] = offsetInput[inputOffset + j];
-            }
-
-            let x = f_buffer[8 * i + 0];
-            let y = f_buffer[8 * i + 1];
-            let z = f_buffer[8 * i + 2];
-            const dynamicOffset = i * 8;
-            const dt = time - dynamicBuffer[dynamicOffset + 6];
-            const halfDtSquared = 0.5 * dt * dt;
-            x += dynamicBuffer[dynamicOffset + 0] * dt + dynamicBuffer[dynamicOffset + 3] * halfDtSquared;
-            y += dynamicBuffer[dynamicOffset + 1] * dt + dynamicBuffer[dynamicOffset + 4] * halfDtSquared;
-            z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
-
-            shsnn_input[16] = x;
-            shsnn_input[17] = y;
-            shsnn_input[18] = z;
-            shsnn_input[19] = offsetInput[inputOffset + 16];
-            shsnn_input[20] = offsetInput[inputOffset + 17];
-            shsnn_input[21] = offsetInput[inputOffset + 18];
-            shsnn_input[22] = offsetInput[inputOffset + 19];
-
-            runPyTorch_MLP(shsnn_input, mlpOffset['main.0.weight'], mlpOffset['main.0.bias'], true, feat1);
-            runPyTorch_MLP(feat1, mlpOffset['main.2.weight'], mlpOffset['main.2.bias'], true, feat2);
-            runPyTorch_MLP(feat2, mlpOffset['main.4.weight'], mlpOffset['main.4.bias'], true, feat3);
-            runPyTorch_MLP(feat3, mlpOffset['shs_output.0.weight'], mlpOffset['shs_output.0.bias'], false, sh_offset);
-
-            const shOffset = i * 12;
-            for (let j = 0; j < 12; j++) {
-                finalShs[j] = baseShs[shOffset + j] + sh_offset[j];
-            }
-            writeSHFlatToTexture(sh_f_buffer, i, finalShs);
-        }
-
-        dynamicShState.lastTime = time;
-        return true;
     }
 
     function generateTexture() {
@@ -713,34 +727,60 @@ function contractToUnisphereInPlace(x, y, z, out) {
             dynamic: {
                 enabled: Boolean(dynamicBuffer),
                 time: dynamicTime,
+                gated: Boolean(dynamicGate),
+                staticCount: staticIds ? staticIds.length : 0,
+                dynamicCount: dynamicIds ? dynamicIds.length : 0,
+                adaptiveSort: adaptiveSortEnabled,
+                adaptiveSortBudget,
             },
         });
     }
 
-    function runSort(viewProj) {
-        if (!buffer) return;
-        const f_buffer = new Float32Array(buffer);
-        const hasDynamicMotion = dynamicBuffer && dynamicBuffer.length === vertexCount * 8;
-        const dynamicTimeChanged =
-            hasDynamicMotion &&
-            (!Number.isFinite(lastDynamicSortTime) || Math.abs(dynamicTime - lastDynamicSortTime) > 1e-6);
-        if (lastVertexCount == vertexCount) {
-            let dot =
-                lastProj[2] * viewProj[2] +
-                lastProj[6] * viewProj[6] +
-                lastProj[10] * viewProj[10];
-            if (Math.abs(dot - 1) < 0.01 && !dynamicTimeChanged && !pendingDynamicFrame) {
-                return;
-            }
-        } else {
-            generateTexture();
-            lastVertexCount = vertexCount;
-        }
+    // Quantized view depth of a Gaussian.  Keeping the 4096 scale and the int32
+    // truncation identical to the original monolithic sort means a model without
+    // a dynamic gate still produces exactly the same draw order as before.
+    function quantizeDepth(viewProj, x, y, z) {
+        return ((viewProj[2] * x + viewProj[6] * y + viewProj[10] * z) * DEPTH_KEY_SCALE) | 0;
+    }
 
-        let maxDepth = -Infinity;
-        let minDepth = Infinity;
-        let sizeList = new Int32Array(vertexCount);
-        for (let i = 0; i < vertexCount; i++) {
+    function ensureSortBuffers() {
+        if (depthKeys && depthKeys.length === vertexCount) return;
+        if (!staticIds || !dynamicIds) {
+            // Safety net for a buffer that did not come from the Mobile-GS2
+            // decoder: keep the legacy semantics instead of guessing a split.
+            const hasDynamicMotion = Boolean(dynamicBuffer) && dynamicBuffer.length === vertexCount * 8;
+            buildGaussianSplit(null, hasDynamicMotion, vertexCount);
+        }
+        depthKeys = new Int32Array(vertexCount);
+        staticOrder = new Uint32Array(staticIds.length);
+        dynamicOrder = new Uint32Array(dynamicIds.length);
+        mergedOrder = new Uint32Array(vertexCount);
+        sortBuckets = new Int32Array(vertexCount);
+        sortCounts = new Uint32Array(256 * 256);
+        sortStarts = new Uint32Array(256 * 256);
+        staticOrderValid = false;
+        dynamicOrderValid = false;
+        mergedOrderValid = false;
+    }
+
+    function projectStaticDepths(viewProj) {
+        const f_buffer = new Float32Array(buffer);
+        for (let n = 0; n < staticIds.length; n++) {
+            const i = staticIds[n];
+            depthKeys[i] = quantizeDepth(
+                viewProj,
+                f_buffer[8 * i + 0],
+                f_buffer[8 * i + 1],
+                f_buffer[8 * i + 2],
+            );
+        }
+    }
+
+    function projectDynamicDepths(viewProj) {
+        const f_buffer = new Float32Array(buffer);
+        const hasDynamicMotion = Boolean(dynamicBuffer) && dynamicBuffer.length === vertexCount * 8;
+        for (let n = 0; n < dynamicIds.length; n++) {
+            const i = dynamicIds[n];
             let x = f_buffer[8 * i + 0];
             let y = f_buffer[8 * i + 1];
             let z = f_buffer[8 * i + 2];
@@ -752,42 +792,302 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 y += dynamicBuffer[dynamicOffset + 1] * dt + dynamicBuffer[dynamicOffset + 4] * halfDtSquared;
                 z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
             }
-            let depth =
-                ((viewProj[2] * x + viewProj[6] * y + viewProj[10] * z) * 4096) |
-                0;
-            sizeList[i] = depth;
+            depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+        }
+    }
+
+    // 16 bit single-pass counting sort over one stream.  `ids` is in ascending
+    // Gaussian order, so Gaussians sharing a depth bucket stay ordered by their
+    // original row id - the tie-break the reference renderer uses as well.
+    function sortStream(ids, order) {
+        const count = ids.length;
+        if (count === 0) return;
+        let maxDepth = -Infinity;
+        let minDepth = Infinity;
+        for (let n = 0; n < count; n++) {
+            const depth = depthKeys[ids[n]];
             if (depth > maxDepth) maxDepth = depth;
             if (depth < minDepth) minDepth = depth;
         }
-
-        // This is a 16 bit single-pass counting sort
-        let depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
-        let counts0 = new Uint32Array(256 * 256);
-        for (let i = 0; i < vertexCount; i++) {
-            sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
-            counts0[sizeList[i]]++;
+        const depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
+        sortCounts.fill(0);
+        for (let n = 0; n < count; n++) {
+            const bucket = ((depthKeys[ids[n]] - minDepth) * depthInv) | 0;
+            sortBuckets[n] = bucket;
+            sortCounts[bucket]++;
         }
-        let starts0 = new Uint32Array(256 * 256);
-        for (let i = 1; i < 256 * 256; i++)
-            starts0[i] = starts0[i - 1] + counts0[i - 1];
-        depthIndex = new Uint32Array(vertexCount);
-        for (let i = 0; i < vertexCount; i++)
-            depthIndex[starts0[sizeList[i]]++] = i;
+        sortStarts[0] = 0;
+        for (let i = 1; i < 256 * 256; i++) {
+            sortStarts[i] = sortStarts[i - 1] + sortCounts[i - 1];
+        }
+        for (let n = 0; n < count; n++) {
+            order[sortStarts[sortBuckets[n]]++] = ids[n];
+        }
+    }
+
+    // Merge the two depth-ordered streams into a single draw order, breaking
+    // depth ties by the original Gaussian row id, exactly like the reference
+    // static cache does.
+    function mergeStreams() {
+        const staticCount = staticOrder.length;
+        const dynamicCount = dynamicOrder.length;
+        let s = 0;
+        let d = 0;
+        let out = 0;
+        while (s < staticCount && d < dynamicCount) {
+            const staticId = staticOrder[s];
+            const dynamicId = dynamicOrder[d];
+            const staticDepth = depthKeys[staticId];
+            const dynamicDepth = depthKeys[dynamicId];
+            if (staticDepth < dynamicDepth ||
+                (staticDepth === dynamicDepth && staticId <= dynamicId)) {
+                mergedOrder[out++] = staticId;
+                s++;
+            } else {
+                mergedOrder[out++] = dynamicId;
+                d++;
+            }
+        }
+        while (s < staticCount) mergedOrder[out++] = staticOrder[s++];
+        while (d < dynamicCount) mergedOrder[out++] = dynamicOrder[d++];
+    }
+
+    // Motion extents of the animated rows.  These do not depend on the camera,
+    // so they are measured once after decoding and then bound the view depth
+    // movement of every animated Gaussian for any time and any view.
+    function refreshAdaptiveMotionBounds() {
+        dynamicSpeedBound = 0;
+        dynamicAccelBound = 0;
+        canonicalTimeMin = Number.POSITIVE_INFINITY;
+        canonicalTimeMax = Number.NEGATIVE_INFINITY;
+        if (!dynamicBuffer || !dynamicIds) return;
+        for (let n = 0; n < dynamicIds.length; n++) {
+            const offset = dynamicIds[n] * 8;
+            const speed = Math.hypot(
+                dynamicBuffer[offset + 0],
+                dynamicBuffer[offset + 1],
+                dynamicBuffer[offset + 2],
+            );
+            if (speed > dynamicSpeedBound) dynamicSpeedBound = speed;
+            const accel = Math.hypot(
+                dynamicBuffer[offset + 3],
+                dynamicBuffer[offset + 4],
+                dynamicBuffer[offset + 5],
+            );
+            if (accel > dynamicAccelBound) dynamicAccelBound = accel;
+            const canonical = dynamicBuffer[offset + 6];
+            if (canonical < canonicalTimeMin) canonicalTimeMin = canonical;
+            if (canonical > canonicalTimeMax) canonicalTimeMax = canonical;
+        }
+        if (!Number.isFinite(canonicalTimeMin)) {
+            canonicalTimeMin = 0;
+            canonicalTimeMax = 0;
+        }
+    }
+
+    // Tightest adjacent depth gap of the committed draw order.  Only pairs with
+    // an animated side are considered: two time-invariant rows keep their
+    // relative order forever, and the smallest depth difference of a sorted
+    // sequence is always an adjacent one, so this is the gap that has to be
+    // closed before any pair can swap.
+    function refreshAdaptiveGapMin(order) {
+        depthGapMin = 0;
+        if (!order || order.length < 2) return;
+        depthGapMin = Number.POSITIVE_INFINITY;
+        for (let k = 1; k < order.length; k++) {
+            const previous = order[k - 1];
+            const current = order[k];
+            if (animatedFlags &&
+                !animatedFlags[previous] && !animatedFlags[current]) {
+                continue;
+            }
+            const gap = depthKeys[current] - depthKeys[previous];
+            if (gap < depthGapMin) depthGapMin = gap;
+        }
+        if (!Number.isFinite(depthGapMin)) depthGapMin = 0;
+    }
+
+    // Mean Gaussian radius of the model.  The scheduler compares depth movement
+    // against it, because reordering two rows that lie within a footprint of
+    // each other can only change the result inside their own overlap.
+    function refreshAdaptiveScale() {
+        motionMeanScale = 0;
+        if (!buffer || vertexCount === 0) return;
+        const packed = new Float32Array(buffer);
+        let sum = 0;
+        for (let i = 0; i < vertexCount; i++) {
+            sum += (packed[8 * i + 3] + packed[8 * i + 4] + packed[8 * i + 5]) / 3;
+        }
+        motionMeanScale = sum / vertexCount;
+    }
+
+    // Upper bound on how far the view depth of any Gaussian can travel between
+    // the committed time and `time`.  Displacement is `v * dt + 0.5 * a * dt^2`
+    // with a time offset that differs per Gaussian, which the canonical time
+    // extent turns back into a bound that costs nothing to evaluate.
+    function predictedDepthRate(time) {
+        if (!(dynamicSpeedBound > 0) && !(dynamicAccelBound > 0)) return 0;
+        const tauTime = Math.max(
+            Math.abs(time - canonicalTimeMin),
+            Math.abs(time - canonicalTimeMax),
+        );
+        const tauCommitted = Math.max(
+            Math.abs(committedDepthTime - canonicalTimeMin),
+            Math.abs(committedDepthTime - canonicalTimeMax),
+        );
+        return viewDepthRowNorm * (
+            dynamicSpeedBound +
+            0.5 * dynamicAccelBound * (tauTime + tauCommitted)
+        ) * DEPTH_KEY_SCALE;
+    }
+
+    function predictedDepthMovement(time) {
+        if (!Number.isFinite(committedDepthTime)) return Number.POSITIVE_INFINITY;
+        const elapsed = Math.abs(time - committedDepthTime);
+        if (!(elapsed > 0)) return 0;
+        return elapsed * predictedDepthRate(time);
+    }
+
+    // Depth drift the budget allows at this camera and time, in depth keys.
+    function adaptiveTolerance() {
+        if (!(adaptiveSortBudget > 0) || !(motionMeanScale > 0)) return 0;
+        return adaptiveSortBudget * motionMeanScale * viewDepthRowNorm * DEPTH_KEY_SCALE;
+    }
+
+    // True when the committed order can serve as the draw order for `time`.
+    function canReuseDepthOrder(time) {
+        if (!adaptiveSortEnabled) return false;
+        if (!mergedOrderValid || !Number.isFinite(committedDepthTime)) return false;
+        if (!dynamicIds || dynamicIds.length === 0 || !dynamicBuffer) return true;
+        const movement = predictedDepthMovement(time);
+        if (!(movement > 0)) return true;
+        if (adaptiveSortBudget > 0) {
+            // Tolerance policy: the order may drift, but by less than a Gaussian
+            // footprint, where a swap only reorders rows that overlap anyway.
+            return movement <= adaptiveTolerance();
+        }
+        // Exact policy: no pair can reach a tie, so the draw list is not merely
+        // close to the sorted order, it is the order the sort would produce.
+        return Math.ceil(2 * movement) < depthGapMin;
+    }
+
+    function runSort(viewProj) {
+        if (!buffer) return;
+        const hasDynamicMotion = Boolean(dynamicBuffer) && dynamicBuffer.length === vertexCount * 8;
+        const dynamicPointCount = dynamicIds ? dynamicIds.length : 0;
+        const dynamicTimeChanged =
+            hasDynamicMotion &&
+            dynamicPointCount > 0 &&
+            (!Number.isFinite(lastDynamicSortTime) || Math.abs(dynamicTime - lastDynamicSortTime) > 1e-6);
+
+        let viewChanged = true;
+        if (lastVertexCount == vertexCount) {
+            let dot =
+                lastProj[2] * viewProj[2] +
+                lastProj[6] * viewProj[6] +
+                lastProj[10] * viewProj[10];
+            viewChanged = Math.abs(dot - 1) >= 0.01;
+        }
+        if (lastVertexCount != vertexCount) {
+            generateTexture();
+            lastVertexCount = vertexCount;
+        } else if (!viewChanged && !dynamicTimeChanged && !pendingDynamicFrame) {
+            return;
+        }
+
+        // A playback frame that only advances time may keep the committed draw
+        // order: when the animated rows are provably too slow to close any
+        // neighbouring depth gap, nothing has to be re-projected, re-sorted,
+        // merged or uploaded, and the main thread leaves the index buffer as is.
+        if (adaptiveSortEnabled && !viewChanged && hasDynamicMotion &&
+            dynamicPointCount > 0 && pendingDynamicFrame &&
+            canReuseDepthOrder(dynamicTime)) {
+            const request = pendingDynamicFrame;
+            pendingDynamicFrame = null;
+            self.postMessage({
+                reusedOrder: true,
+                dynamicRequestId: request.requestId,
+                dynamicTime: request.time,
+                vertexCount,
+            });
+            return;
+        }
+
+        ensureSortBuffers();
+        const staticResorted = viewChanged || !staticOrderValid;
+        const dynamicResorted = viewChanged || dynamicTimeChanged || !dynamicOrderValid;
+        let streamsChanged = false;
+        if (staticResorted) {
+            // The static stream never moves, so a fixed camera keeps its
+            // projection and sort until the view direction actually changes.
+            projectStaticDepths(viewProj);
+            sortStream(staticIds, staticOrder);
+            staticOrderValid = true;
+            streamsChanged = true;
+        }
+        if (dynamicResorted) {
+            projectDynamicDepths(viewProj);
+            sortStream(dynamicIds, dynamicOrder);
+            dynamicOrderValid = true;
+            streamsChanged = true;
+        }
+        // A single non-empty stream already is a complete draw order, so
+        // merging would only add a redundant pass over every Gaussian.  A
+        // legacy export without gate metadata is exactly that case, and it
+        // must not become slower than the pre-separation sort.
+        const needsMerge = staticIds.length > 0 && dynamicIds.length > 0;
+        if (streamsChanged || !mergedOrderValid) {
+            if (needsMerge) mergeStreams();
+            mergedOrderValid = true;
+        }
 
         lastProj = viewProj;
         lastDynamicSortTime = hasDynamicMotion ? dynamicTime : Number.NaN;
-        const message = { depthIndex, viewProj, vertexCount };
-        const transfer = [depthIndex.buffer];
+        const drawOrder = needsMerge
+            ? mergedOrder
+            : (staticIds.length > 0 ? staticOrder : dynamicOrder);
+        if (adaptiveSortEnabled && hasDynamicMotion) {
+            // The cached order is committed at this time, and the gap histogram
+            // tells the next playback frame how much movement it can absorb.
+            viewDepthRowNorm = Math.hypot(viewProj[2], viewProj[6], viewProj[10]);
+            committedDepthTime = dynamicTime;
+            if (adaptiveSortBudget <= 0) {
+                refreshAdaptiveGapMin(drawOrder);
+            } else {
+                depthGapMin = 0;
+            }
+        }
+        // The draw order is posted as a copy instead of being transferred so
+        // the worker can reuse its buffer for the next frame rather than
+        // allocating a vertexCount-sized array on every dynamic frame.
+        const message = {
+            depthIndex: drawOrder,
+            viewProj,
+            vertexCount,
+            sortStats: {
+                staticPoints: staticIds.length,
+                dynamicPoints: dynamicIds.length,
+                staticResorted,
+                dynamicResorted,
+                merged: needsMerge,
+                adaptive: adaptiveSortEnabled,
+                // What the scheduler measured when it committed this order: the
+                // tightest movable depth gap of the draw list, how fast the
+                // animated rows travel through the depth axis, and how much
+                // drift the budget tolerates.
+                adaptiveGapMin: adaptiveSortEnabled && adaptiveSortBudget <= 0
+                    ? depthGapMin
+                    : undefined,
+                adaptiveRate: adaptiveSortEnabled ? predictedDepthRate(dynamicTime) : undefined,
+                adaptiveTolerance: adaptiveSortEnabled ? adaptiveTolerance() : undefined,
+            },
+        };
         if (pendingDynamicFrame) {
             message.dynamicRequestId = pendingDynamicFrame.requestId;
             message.dynamicTime = pendingDynamicFrame.time;
-            if (pendingDynamicFrame.shPayload) {
-                message.dynamicSh = pendingDynamicFrame.shPayload;
-                transfer.push(pendingDynamicFrame.shPayload.texdata_sh.buffer);
-            }
             pendingDynamicFrame = null;
         }
-        self.postMessage(message, transfer);
+        self.postMessage(message);
     }
 
     const throttledSort = () => {
@@ -831,10 +1131,14 @@ function contractToUnisphereInPlace(x, y, z, out) {
                     const arr = new Float32Array(alignedBuffer);
                     arr.shape = node.shape; // <-- ADD THIS
                         return arr;
+                    } else if (node.dtype === 'uint8' || node.dtype === 'bool') {
+                    // Checked before the generic integer branch: "uint8"
+                    // contains the substring "int" and would otherwise be
+                    // read back as 32 bit integers (the compressed dynamic
+                    // gate is a packed uint8 bit stream).
+                    return new Uint8Array(alignedBuffer);
                     } else if (node.dtype.includes('int')) {
                         return new Int32Array(alignedBuffer);
-                    } else if (node.dtype === 'uint8') {
-                        return new Uint8Array(alignedBuffer);
                     }
                 } else if (Array.isArray(node)) {
                     return node.map(reconstruct);
@@ -1048,6 +1352,87 @@ function contractToUnisphereInPlace(x, y, z, out) {
         return packed;
     }
 
+    // Mobile-GS2 writes the committed gate as `np.packbits(mask,
+    // bitorder='little')`, so bit i of Gaussian i lives in byte i >> 3 at
+    // position i & 7.  A model whose gate cannot be trusted falls back to the
+    // pre-gate behaviour instead of rendering a wrong partition.
+    function decodeDynamicGate(save_dict, pointCount) {
+        if (!save_dict['dynamic_enabled']) return null;
+        const packed = save_dict['dynamic_gate_bits'];
+        const gateCount = Number(save_dict['dynamic_gate_count']);
+        if (!packed || !Number.isFinite(gateCount)) return null;
+        if (gateCount !== pointCount) {
+            console.warn(
+                "Dynamic gate covers " + gateCount + " Gaussians but the model has " +
+                pointCount + "; treating every Gaussian as dynamic.",
+            );
+            return null;
+        }
+        if (packed.length < Math.ceil(pointCount / 8)) {
+            console.warn(
+                "Dynamic gate payload is truncated; treating every Gaussian as dynamic.",
+            );
+            return null;
+        }
+        const gate = new Uint8Array(pointCount);
+        for (let i = 0; i < pointCount; i++) {
+            gate[i] = (packed[i >> 3] >> (i & 7)) & 1;
+        }
+        return gate;
+    }
+
+    // The reference renderer evaluates displacement as gate * trajectory and
+    // temporal opacity as (1 - gate) + gate * exp(...), so a static row keeps its
+    // canonical position and opacity at every time step.  Writing that sentinel
+    // back into the motion texture makes the shader reproduce it exactly: zero
+    // velocity and acceleration freeze the position, and a very long duration
+    // makes the temporal term evaluate to one.
+    function materializeStaticTemporalRows(gate, pointCount) {
+        if (!dynamicBuffer || !gate) return 0;
+        const staticLogDuration = Math.log(1e15);
+        let staticRows = 0;
+        for (let i = 0; i < pointCount; i++) {
+            if (gate[i]) continue;
+            const offset = i * 8;
+            dynamicBuffer[offset + 0] = 0;
+            dynamicBuffer[offset + 1] = 0;
+            dynamicBuffer[offset + 2] = 0;
+            dynamicBuffer[offset + 3] = 0;
+            dynamicBuffer[offset + 4] = 0;
+            dynamicBuffer[offset + 5] = 0;
+            dynamicBuffer[offset + 6] = 0;
+            dynamicBuffer[offset + 7] = staticLogDuration;
+            staticRows++;
+        }
+        return staticRows;
+    }
+
+    // Partition the point ids into the two streams the sort works on.  Without
+    // gate metadata the export keeps the older semantics: a dynamic model moves
+    // every Gaussian, a static model moves none of them.
+    function buildGaussianSplit(gate, hasDynamicMotion, pointCount) {
+        let animated;
+        if (gate) {
+            animated = gate;
+        } else if (hasDynamicMotion) {
+            animated = new Uint8Array(pointCount);
+            animated.fill(1);
+        } else {
+            animated = new Uint8Array(pointCount);
+        }
+        animatedFlags = animated;
+        let dynamicCount = 0;
+        for (let i = 0; i < pointCount; i++) dynamicCount += animated[i];
+        staticIds = new Uint32Array(pointCount - dynamicCount);
+        dynamicIds = new Uint32Array(dynamicCount);
+        let staticIndex = 0;
+        let dynamicIndex = 0;
+        for (let i = 0; i < pointCount; i++) {
+            if (animated[i]) dynamicIds[dynamicIndex++] = i;
+            else staticIds[staticIndex++] = i;
+        }
+    }
+
 
   // Matches Python: contract_to_unisphere (Forward pass only)
 function contractToUnisphere(x, y, z) {
@@ -1177,12 +1562,12 @@ function contractToUnisphere(x, y, z) {
         // dynamic one cannot accidentally reuse the previous motion texture.
         dynamicBuffer = null;
         covarianceBuffer = null;
-        dynamicShState = null;
         dynamicTime = 0;
         lastDynamicSortTime = Number.NaN;
         pendingDynamicFrame = null;
         lastVertexCount = 0;
         lastProj = [];
+        resetSortState();
         if (!tmc3Module) throw new Error("TMC3 WASM not ready.");
 
         const fileSystem = tmc3Module.FS || self.FS;
@@ -1319,6 +1704,17 @@ function contractToUnisphere(x, y, z) {
         const appearance = decodeVQAttributesConcat(save_dict['app_index'], save_dict['app_htable'], save_dict['app_code'], vertexCount);
         dynamicBuffer = decodeDynamicAttributes(save_dict, vertexCount);
         const hasDynamicModel = Boolean(dynamicBuffer);
+        // Load the two streams separately: decode the committed gate, freeze the
+        // time-invariant rows, and partition the point ids so a playback frame
+        // only has to touch the animated subset.
+        dynamicGate = decodeDynamicGate(save_dict, vertexCount);
+        buildGaussianSplit(dynamicGate, hasDynamicModel, vertexCount);
+        materializeStaticTemporalRows(dynamicGate, vertexCount);
+        refreshAdaptiveMotionBounds();
+        console.log(
+            "Gaussian split: " + staticIds.length + " static / " + dynamicIds.length +
+            " dynamic" + (dynamicGate ? "" : " (no gate metadata)"),
+        );
         const rotationFeatureDim = rotation.length / vertexCount;
         const serializedRotationFeatureDim = Number(save_dict['rot_feature_dim']);
         if (!Number.isInteger(rotationFeatureDim) || rotationFeatureDim <= 0 ||
@@ -1338,8 +1734,6 @@ function contractToUnisphere(x, y, z) {
         const u_buffer = new Uint8Array(buffer);
         covarianceBuffer = new Float32Array(vertexCount * 6);
         shBuffer = new ArrayBuffer(vertexCount * 48); 
-        const dynamicBaseShs = hasDynamicModel ? new Float32Array(vertexCount * 12) : null;
-        const dynamicOffsetInput = hasDynamicModel ? new Float32Array(vertexCount * 20) : null;
 
         const encoded_xyz = new Float32Array(96);
         const cont_feature = new Float32Array(13);
@@ -1471,46 +1865,35 @@ function contractToUnisphere(x, y, z) {
             covarianceBuffer[covarianceOffset + 4] = m1 * m2 + m4 * m5 + m7 * m8;
             covarianceBuffer[covarianceOffset + 5] = m2 * m2 + m5 * m5 + m8 * m8;
 
-            if (hasDynamicModel) {
-                const baseOffset = i * 12;
-                for (let j = 0; j < 12; j++) {
-                    dynamicBaseShs[baseOffset + j] = shs_flat[j];
-                }
+            // Mobile-4DGS bakes this attribute-conditioned SH residual into the
+            // explicit Gaussian parameters before inference, so the residual
+            // network runs exactly once per Gaussian here - never per frame.
+            // The residual only depends on intrinsic attributes, and the
+            // canonical position is the same input the reference decoder uses.
+            shsnn_input.set(shs_norm, 0);
+            shsnn_input[12] = act_opacity;
+            shsnn_input.set(scales_norm, 13);
 
-                const inputOffset = i * 20;
-                for (let j = 0; j < 12; j++) {
-                    dynamicOffsetInput[inputOffset + j] = shs_norm[j];
-                }
-                dynamicOffsetInput[inputOffset + 12] = act_opacity;
-                dynamicOffsetInput[inputOffset + 13] = scales_norm[0];
-                dynamicOffsetInput[inputOffset + 14] = scales_norm[1];
-                dynamicOffsetInput[inputOffset + 15] = scales_norm[2];
-                dynamicOffsetInput[inputOffset + 16] = act_rot_0;
-                dynamicOffsetInput[inputOffset + 17] = act_rot_1;
-                dynamicOffsetInput[inputOffset + 18] = act_rot_2;
-                dynamicOffsetInput[inputOffset + 19] = act_rot_3;
-            } else {
-                shsnn_input.set(shs_norm, 0);       
-                shsnn_input[12] = act_opacity;      
-                shsnn_input.set(scales_norm, 13);   
-                
-                shsnn_input[16] = x; shsnn_input[17] = y; shsnn_input[18] = z;
-                shsnn_input[19] = act_rot_0; shsnn_input[20] = act_rot_1; 
-                shsnn_input[21] = act_rot_2; shsnn_input[22] = act_rot_3;
+            shsnn_input[16] = x;
+            shsnn_input[17] = y;
+            shsnn_input[18] = z;
+            shsnn_input[19] = act_rot_0;
+            shsnn_input[20] = act_rot_1;
+            shsnn_input[21] = act_rot_2;
+            shsnn_input[22] = act_rot_3;
 
-                runPyTorch_MLP(shsnn_input, save_dict['MLP_offset']['main.0.weight'], save_dict['MLP_offset']['main.0.bias'], true, feat1);
-                runPyTorch_MLP(feat1, save_dict['MLP_offset']['main.2.weight'], save_dict['MLP_offset']['main.2.bias'], true, feat2);
-                runPyTorch_MLP(feat2, save_dict['MLP_offset']['main.4.weight'], save_dict['MLP_offset']['main.4.bias'], true, feat3);
-                runPyTorch_MLP(feat3, save_dict['MLP_offset']['shs_output.0.weight'], save_dict['MLP_offset']['shs_output.0.bias'], false, sh_offset);
+            runPyTorch_MLP(shsnn_input, save_dict['MLP_offset']['main.0.weight'], save_dict['MLP_offset']['main.0.bias'], true, feat1);
+            runPyTorch_MLP(feat1, save_dict['MLP_offset']['main.2.weight'], save_dict['MLP_offset']['main.2.bias'], true, feat2);
+            runPyTorch_MLP(feat2, save_dict['MLP_offset']['main.4.weight'], save_dict['MLP_offset']['main.4.bias'], true, feat3);
+            runPyTorch_MLP(feat3, save_dict['MLP_offset']['shs_output.0.weight'], save_dict['MLP_offset']['shs_output.0.bias'], false, sh_offset);
 
-                _features_dc[0] += sh_offset[0]; 
-                _features_dc[1] += sh_offset[1]; 
-                _features_dc[2] += sh_offset[2];
-                for(let r = 0; r < 3; r++) {
-                    _features_rest[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
-                    _features_rest[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
-                    _features_rest[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
-                }
+            _features_dc[0] += sh_offset[0];
+            _features_dc[1] += sh_offset[1];
+            _features_dc[2] += sh_offset[2];
+            for (let r = 0; r < 3; r++) {
+                _features_rest[r * 3 + 0] += sh_offset[(r + 1) * 3 + 0];
+                _features_rest[r * 3 + 1] += sh_offset[(r + 1) * 3 + 1];
+                _features_rest[r * 3 + 2] += sh_offset[(r + 1) * 3 + 2];
             }
 
             
@@ -1536,15 +1919,15 @@ function contractToUnisphere(x, y, z) {
             u_buffer[32 * i + 28 + 3] = Math.max(0, Math.min(255, act_rot_3 * 128 + 128));
 
  
-            if (!hasDynamicModel) {
-                shs_flat[0] = _features_dc[0];
-                shs_flat[1] = _features_dc[1];
-                shs_flat[2] = _features_dc[2];
-                for (let j = 0; j < 9; j++) {
-                    shs_flat[3 + j] = _features_rest[j];
-                }
-                writeSHFlatToTexture(sh_f_buffer, i, shs_flat);
+            shs_flat[0] = _features_dc[0];
+            shs_flat[1] = _features_dc[1];
+            shs_flat[2] = _features_dc[2];
+            for (let j = 0; j < 9; j++) {
+                shs_flat[3 + j] = _features_rest[j];
             }
+            // The residual above is baked into these coefficients, so one
+            // upload covers the whole session for every Gaussian.
+            writeSHFlatToTexture(sh_f_buffer, i, shs_flat);
             
             
 
@@ -1567,16 +1950,10 @@ function contractToUnisphere(x, y, z) {
           
      
         console.timeEnd("Neural Decode Loop");
-        if (hasDynamicModel) {
-            dynamicShState = {
-                baseShs: dynamicBaseShs,
-                offsetInput: dynamicOffsetInput,
-                mlpOffset: save_dict['MLP_offset'],
-                lastTime: Number.NaN,
-            };
-            updateDynamicShBuffer(dynamicTime);
-        }
         reportProgress("decompose", 95);
+        // The decoder has written every scale by now, so the scheduler knows how
+        // large a Gaussian footprint is on the depth axis.
+        refreshAdaptiveScale();
         Object.keys(save_dict).forEach(key => delete save_dict[key]);
         return buffer;
     }
@@ -1603,6 +1980,17 @@ function contractToUnisphere(x, y, z) {
             buffer = e.data.buffer;
             vertexCount = e.data.vertexCount;
             covarianceBuffer = null;
+        } else if (e.data.adaptiveSort) {
+            // The scheduling policy is a viewer setting rather than a model
+            // property, so it can arrive before or after a model is decoded.
+            adaptiveSortEnabled = e.data.adaptiveSort.enabled === true;
+            const budget = Number(e.data.adaptiveSort.budget);
+            adaptiveSortBudget = Number.isFinite(budget) && budget >= 0 ? budget : 0;
+            // Force the next request to commit a fresh order under the new
+            // policy instead of reusing one that was sized for the old budget.
+            committedDepthTime = Number.NaN;
+            mergedOrderValid = false;
+            refreshAdaptiveMotionBounds();
         } else if (e.data.view) {
             viewProj = e.data.view;
             throttledSort();
@@ -1611,14 +1999,9 @@ function contractToUnisphere(x, y, z) {
                 const nextTime = e.data.time;
                 const timeChanged = Math.abs(dynamicTime - nextTime) > 1e-6;
                 dynamicTime = nextTime;
-                const shouldUpdateSh = e.data.updateDynamicSh !== false;
-                const shPayload = shouldUpdateSh && updateDynamicShBuffer(dynamicTime)
-                    ? createShTexturePayload()
-                    : null;
                 pendingDynamicFrame = {
                     requestId: e.data.dynamicRequestId,
                     time: dynamicTime,
-                    shPayload,
                 };
                 if (timeChanged) {
                     lastDynamicSortTime = Number.NaN;
@@ -1845,6 +2228,7 @@ function ensureViewerDom() {
         `
         <div id="info">
             <h3 class="nohf">Flux-GS</h3>
+            <div id="split-info"></div>
         </div>
         <div id="progress-panel">
             <div id="progress-label">Loading model 0%</div>
@@ -1963,18 +2347,30 @@ async function main() {
                 : 30
         );
     // Dynamic motion is cheap in the vertex shader, so keep it synchronized
-    // with the display by default. The per-Gaussian appearance MLP remains an
-    // opt-in playback cost and is still evaluated for paused/scrubbed frames.
+    // with the display by default. The appearance residual is baked into the
+    // SH texture at load time, so playback never evaluates a network.
     const smoothDynamicPlayback = viewerConfig.smoothDynamicPlayback !== false;
-    const dynamicShDuringPlayback = viewerConfig.dynamicShDuringPlayback === true;
     const debugWebGL = viewerConfig.debugWebGL === true;
+    // Adaptive sort scheduling keeps the last depth order while the animated
+    // Gaussians are too slow to reorder it.  The budget is the depth drift the
+    // scheduler may accept, measured in mean Gaussian radii: 0 demands that no
+    // pair can even reach a tie, and a larger value keeps an order that has
+    // drifted by less than that.  Set adaptiveSort: false to restore
+    // fixed-rate sorting.
+    const configuredSortBudget = Number(
+        params.get("adaptiveSortBudget") ?? viewerConfig.adaptiveSortBudget ?? 0.5,
+    );
+    const adaptiveSortEnabled =
+        viewerConfig.adaptiveSort !== false &&
+        Number.isFinite(configuredSortBudget) && configuredSortBudget >= 0;
+    const adaptiveSortBudget = adaptiveSortEnabled ? configuredSortBudget : 0;
     const dynamicAutoplayParam = params.get("dynamicAutoplay");
     const initialDynamicPlayback = dynamicAutoplayParam === null
         ? viewerConfig.dynamicAutoplay !== false
         : !["0", "false", "off"].includes(dynamicAutoplayParam.toLowerCase());
     const modelBaseUrl =
         viewerConfig.modelBaseUrl ||
-        "https://huggingface.co/datasets/mobile-gs2/mobile-gs2-dynamic/resolve/main/";
+        "https://huggingface.co/datasets/mobile-gs2/Mobile-4DGS/resolve/main/";
     const configuredCameraUrl = params.get("cameraUrl") ?? viewerConfig.cameraUrl;
     const isCameraList = (candidate) =>
         Array.isArray(candidate) && candidate.length > 0 && candidate.every((entry) =>
@@ -2057,7 +2453,7 @@ async function main() {
 
 
         // Locate this in your main() function:
-    const tmc3Path = new URL("../tools/tmc3.js", window.location.href).href;
+    const tmc3Path = new URL("../tools/tmc3.js", MAIN_SCRIPT_URL).href;
 
     const worker = new Worker(
         URL.createObjectURL(
@@ -2066,6 +2462,12 @@ async function main() {
             }),
         ),
     );
+    worker.postMessage({
+        adaptiveSort: {
+            enabled: adaptiveSortEnabled,
+            budget: adaptiveSortBudget,
+        },
+    });
     // const worker = new Worker(
     //     URL.createObjectURL(
     //         new Blob(["(", createWorker.toString(), ")(self)"], {
@@ -2251,7 +2653,6 @@ async function main() {
         worker.postMessage({
             time,
             dynamicRequestId: requestId,
-            updateDynamicSh: !dynamicPlayback || dynamicShDuringPlayback,
         });
         lastDynamicSortAt = now;
     };
@@ -2259,9 +2660,10 @@ async function main() {
     const requestDynamicSort = (now, force = false) => {
         if (!dynamicScene || (!force && now - lastDynamicSortAt < dynamicSortInterval)) return;
         if (activeDynamicRequestId !== null) {
-            // Keep only the newest requested time. The SH network is expensive,
-            // so queuing every animation-frame timestamp would make rendering
-            // drift farther and farther behind playback.
+            // Keep only the newest requested time. A worker frame still has to
+            // re-project and re-sort the animated stream, so queuing every
+            // animation-frame timestamp would make rendering drift farther and
+            // farther behind playback.
             queuedDynamicTime = dynamicTime;
             lastDynamicSortAt = now;
             return;
@@ -2287,7 +2689,7 @@ async function main() {
 
         // A worker frame can finish well after Pause is pressed. Invalidate
         // that response, retain only the newest paused/scrubbed time, and wait
-        // for the in-flight work before requesting another expensive frame.
+        // for the in-flight work before requesting another sort.
         if (activeDynamicRequestId !== null) {
             discardActiveDynamicFrame = true;
             queuedDynamicTime = dynamicTime;
@@ -2449,6 +2851,15 @@ async function main() {
                 gl.uniform1f(u_dynamicTime, renderedDynamicTime);
             }
             gl.uniform1i(u_dynamicEnabled, dynamicScene ? 1 : 0);
+            const split = e.data.dynamic;
+            const splitInfo = document.getElementById("split-info");
+            if (splitInfo) {
+                splitInfo.innerText = Number.isFinite(split.staticCount) &&
+                    split.staticCount + split.dynamicCount > 0
+                    ? `${split.staticCount.toLocaleString()} static / ` +
+                        `${split.dynamicCount.toLocaleString()} dynamic`
+                    : "";
+            }
             const syncedInitialCameraTime =
                 dynamicScene &&
                 !hasConfiguredInitialDynamicTime &&
@@ -2457,7 +2868,7 @@ async function main() {
                 setDynamicTime(dynamicTime, performance.now(), true);
             }
             updateDynamicControls();
-        } else if (e.data.depthIndex) {
+        } else if (e.data.depthIndex || e.data.reusedOrder) {
             const { depthIndex, viewProj } = e.data;
             const hasDynamicRequestId = Number.isInteger(e.data.dynamicRequestId);
             const isDynamicFrame =
@@ -2478,12 +2889,13 @@ async function main() {
                 }
                 return;
             }
-            if (isDynamicFrame && e.data.dynamicSh &&
-                (!smoothDynamicPlayback || !dynamicPlayback)) {
-                uploadShTexture(e.data.dynamicSh);
+            if (depthIndex) {
+                // A reused order arrives without an index buffer: the worker
+                // proved that the committed draw list is still ordered, so the
+                // GPU buffer and its upload are skipped entirely.
+                gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             }
-            gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);
             vertexCount = e.data.vertexCount;
             if (isDynamicFrame) {
                 // The default path commits all dynamic state atomically. A

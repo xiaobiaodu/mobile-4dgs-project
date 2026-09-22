@@ -24,6 +24,11 @@ h3 {
     margin: 5px 0;
 }
 
+#split-info {
+    font-size: 12px;
+    opacity: 0.75;
+}
+
 p {
     margin: 5px 0;
     font-size: small;

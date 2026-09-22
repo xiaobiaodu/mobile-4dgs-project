@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!-- Harness self test: the panel markup mirrors index.html, but the traffic
+     comes from smoke.js instead of the viewer, so no model is downloaded. -->
+<html lang="en" dir="ltr">
+    <head>
+        <title>Bench harness smoke test</title>
+        <meta charset="utf-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no"
+        />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta
+            name="apple-mobile-web-app-status-bar-style"
+            content="black-translucent"
+        />
+        <link rel="stylesheet" href="../../render_shared/viewer.css" />
+        <link rel="stylesheet" href="bench.css" />
+    </head>
+    <body>
+        <div id="bench-panel">
+            <div id="bench-head">
+                <span id="bench-title">Bench harness smoke test</span>
+                <span id="bench-status">loading</span>
+                <button id="bench-toggle" type="button">hide</button>
+            </div>
+            <div id="bench-body">
+                <div id="bench-controls"></div>
+                <div id="bench-buttons">
+                    <button id="bench-run" type="button" disabled>Run</button>
+                    <button id="bench-stop" type="button">Stop</button>
+                    <button id="bench-sweep" type="button">Sweep</button>
+                    <button id="bench-apply" type="button">Apply &amp; reload</button>
+                    <button id="bench-clear" type="button">Clear</button>
+                    <button id="bench-csv" type="button">CSV</button>
+                    <button id="bench-json" type="button">JSON</button>
+                    <button id="bench-copy" type="button">Copy</button>
+                </div>
+                <pre id="bench-live"></pre>
+                <pre id="bench-hint"></pre>
+                <pre id="bench-table">no measurements yet</pre>
+                <textarea
+                    id="bench-export"
+                    spellcheck="false"
+                    placeholder="CSV or JSON export appears here"
+                ></textarea>
+            </div>
+        </div>
+        <script src="metrics.js?v=20260921-bench"></script>
+        <script src="bench.js?v=20260921-bench"></script>
+        <script src="smoke.js?v=20260921-bench"></script>
+    </body>
+</html>

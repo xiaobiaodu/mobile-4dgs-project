@@ -1,0 +1,114 @@
+#bench-panel {
+    position: absolute;
+    z-index: 500;
+    top: 8px;
+    left: 8px;
+    width: min(520px, calc(100vw - 16px));
+    max-height: calc(100vh - 16px);
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.62);
+    font-family: monospace;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+#bench-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#bench-title {
+    font-weight: bold;
+}
+
+#bench-status {
+    flex: 1;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    opacity: 0.85;
+}
+
+#bench-body {
+    overflow: auto;
+}
+
+#bench-controls,
+#bench-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0;
+    align-items: center;
+}
+
+#bench-controls label {
+    opacity: 0.85;
+}
+
+#bench-panel button,
+#bench-panel select,
+#bench-export {
+    padding: 3px 7px;
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 4px;
+    color: inherit;
+    background: rgba(255, 255, 255, 0.12);
+    font: inherit;
+}
+
+#bench-panel button {
+    cursor: pointer;
+}
+
+#bench-panel button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+#bench-panel select option {
+    background: #111;
+}
+
+#bench-live,
+#bench-hint,
+#bench-table {
+    margin: 6px 0;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+#bench-live {
+    opacity: 0.95;
+}
+
+#bench-hint {
+    opacity: 0.7;
+}
+
+#bench-table {
+    padding: 4px 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+#bench-export {
+    width: 100%;
+    height: 84px;
+    box-sizing: border-box;
+    font-size: 11px;
+    background: rgba(0, 0, 0, 0.5);
+}
+
+@media (max-width: 640px) {
+    #bench-panel {
+        width: calc(100vw - 16px);
+        max-height: 62vh;
+        font-size: 11px;
+    }
+}
