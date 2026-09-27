@@ -100,10 +100,70 @@ function buildPly(ints) {
     return new Uint8Array(Buffer.concat([headerBytes, data]));
 }
 
-// The viewer's view-space depth: 4096 quantisation with int32 truncation.
+// The pre-gate viewer's view-space depth: 4096 quantisation with int32
+// truncation.  A model without usable gate metadata is still ordered by it.
 function depthKey(viewProj, x, y, z) {
     return ((Math.fround(viewProj[2]) * x + Math.fround(viewProj[6]) * y +
         Math.fround(viewProj[10]) * z) * 4096) | 0;
+}
+
+// The 16 bit key space of a gated model (Sec. IV-D): the unit depth axis n,
+// the interval [z_min, z_max] shared by both streams, and the clipped key
+// q = clip(floor(kappa * (z - z_min)), 0, 65535) with
+// kappa = 65535 / (z_max - z_min).  The worker measures the interval once per
+// camera over the decoded rows of the whole model, so the reference order has
+// to be built from the same interval.
+const DEPTH_KEY_MAX = 65535;
+
+function depthAxisOf(viewProj) {
+    const x = Math.fround(viewProj[2]);
+    const y = Math.fround(viewProj[6]);
+    const z = Math.fround(viewProj[10]);
+    const norm = Math.hypot(x, y, z);
+    return [x / norm, y / norm, z / norm];
+}
+
+function depthIntervalOf(positions, axis, attributes, dynamicMask) {
+    let low = Infinity;
+    let high = -Infinity;
+    for (const position of positions) {
+        const z = axis[0] * position[0] + axis[1] * position[1] + axis[2] * position[2];
+        if (z < low) low = z;
+        if (z > high) high = z;
+    }
+    // The worker also covers the worst-case travel of the animated rows over
+    // the clip, so that no row is clipped onto the interval boundary.
+    let speed = 0;
+    let accel = 0;
+    let earliest = Infinity;
+    let latest = -Infinity;
+    for (let id = 0; id < positions.length; id++) {
+        if (!dynamicMask[id]) continue;
+        const attribute = attributes[id];
+        speed = Math.max(speed, Math.hypot(attribute[0], attribute[1], attribute[2]));
+        accel = Math.max(accel, Math.hypot(attribute[3], attribute[4], attribute[5]));
+        earliest = Math.min(earliest, attribute[6]);
+        latest = Math.max(latest, attribute[6]);
+    }
+    if (!Number.isFinite(earliest)) {
+        earliest = 0;
+        latest = 0;
+    }
+    const tauMax = Math.max(0, latest, 1 - earliest);
+    const travel = speed * tauMax + 0.5 * accel * tauMax * tauMax;
+    low -= travel;
+    high += travel;
+    if (!(high > low)) {
+        const only = Number.isFinite(low) ? low : 0;
+        return { min: only, max: only, scale: 0 };
+    }
+    return { min: low, max: high, scale: DEPTH_KEY_MAX / (high - low) };
+}
+
+function quantizedKeyOf(interval, axis, x, y, z) {
+    const q = (interval.scale * (axis[0] * x + axis[1] * y + axis[2] * z - interval.min)) | 0;
+    if (q < 0) return 0;
+    return q > DEPTH_KEY_MAX ? DEPTH_KEY_MAX : q;
 }
 
 function motionAt(attribute, time) {
@@ -116,15 +176,19 @@ function motionAt(attribute, time) {
     };
 }
 
-// Brute force reference: order by quantized depth, ties broken by row id.
-function expectedOrder(positions, attributes, time, viewProj) {
+// Brute force reference: order by the 16 bit key of a gated model, ties broken
+// by row id.
+function expectedOrder(positions, attributes, dynamicMask, time, viewProj) {
+    const axis = depthAxisOf(viewProj);
+    const interval = depthIntervalOf(positions, axis, attributes, dynamicMask);
     return positions
         .map((position, id) => {
             const offset = motionAt(attributes[id], time);
             return {
                 id,
-                key: depthKey(
-                    viewProj,
+                key: quantizedKeyOf(
+                    interval,
+                    axis,
                     position[0] + offset.x,
                     position[1] + offset.y,
                     position[2] + offset.z,
@@ -600,14 +664,21 @@ test("gated sort matches the exact depth order and caches the static stream", as
     await harness.load(model);
     await harness.sendView(VIEW_PROJECTION);
 
-    // The synthetic scene keeps each stream's depth range under the 65536 bucket
-    // count, so the stream order is exactly depth-then-row-id and the merged
-    // order has to equal the brute force result.
+    // Both streams are quantised against the one interval the worker measures
+    // over the whole model, so no key leaves the 16 bit range and the stream
+    // order is exactly key-then-row-id.
+    const axis = depthAxisOf(VIEW_PROJECTION);
+    const interval = depthIntervalOf(
+        model.positions,
+        axis,
+        materializedAttributes(modelAttributes(model), model.dynamicMask),
+        model.dynamicMask,
+    );
     const ranges = [staticIds, dynamicIds].map((ids) => {
-        const keys = ids.map((id) => depthKey(VIEW_PROJECTION, ...model.positions[id]));
+        const keys = ids.map((id) => quantizedKeyOf(interval, axis, ...model.positions[id]));
         return Math.max(...keys) - Math.min(...keys);
     });
-    for (const range of ranges) assert.ok(range < 65535, "test fixture must fit the bucket range");
+    for (const range of ranges) assert.ok(range <= DEPTH_KEY_MAX, "keys stay in the 16 bit range");
 
     const frames = [{ time: 0, viewProj: VIEW_PROJECTION }];
     frames.push({ time: 0, viewProj: ALT_VIEW_PROJECTION });
@@ -631,7 +702,7 @@ test("gated sort matches the exact depth order and caches the static stream", as
         );
         assert.deepEqual(
             order,
-            expectedOrder(model.positions, attributes, frame.time, frame.viewProj),
+            expectedOrder(model.positions, attributes, model.dynamicMask, frame.time, frame.viewProj),
             `frame ${index} must reproduce the exact depth order`,
         );
     }
@@ -693,7 +764,7 @@ test("a gate without animation still keeps the exact static order", async () => 
     await harness.load(model);
     await harness.sendView(VIEW_PROJECTION);
     const first = harness.lastOrder();
-    assert.deepEqual(first, expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION));
+    assert.deepEqual(first, expectedOrder(model.positions, attributes, model.dynamicMask, 0, VIEW_PROJECTION));
 
     await harness.sendTime(0.6, 1);
     const second = harness.lastOrder();
@@ -868,7 +939,7 @@ test("a level keeps the top share of each stream and stays depth ordered", async
     );
     assert.deepEqual(
         order,
-        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION).filter((id) => kept.includes(id)),
+        expectedOrder(model.positions, attributes, model.dynamicMask, 0, VIEW_PROJECTION).filter((id) => kept.includes(id)),
         "the kept Gaussians stay in the reference depth order",
     );
 
@@ -910,6 +981,7 @@ test("raising the level back restores every Gaussian", async () => {
         expectedOrder(
             model.positions,
             materializedAttributes(modelAttributes(model), model.dynamicMask),
+            model.dynamicMask,
             0,
             VIEW_PROJECTION,
         ),
@@ -923,10 +995,13 @@ test("raising the level back restores every Gaussian", async () => {
 // order, so the fixture measures that gap itself instead of hard coding it.
 function strictScheduleTimes(harness, model, commitTime = 0) {
     const attributes = materializedAttributes(modelAttributes(model), model.dynamicMask);
+    const axis = depthAxisOf(VIEW_PROJECTION);
+    const interval = depthIntervalOf(model.positions, axis, attributes, model.dynamicMask);
     const keys = model.positions.map((position, id) => {
         const offset = motionAt(attributes[id], commitTime);
-        return depthKey(
-            VIEW_PROJECTION,
+        return quantizedKeyOf(
+            interval,
+            axis,
             position[0] + offset.x,
             position[1] + offset.y,
             position[2] + offset.z,
@@ -935,20 +1010,19 @@ function strictScheduleTimes(harness, model, commitTime = 0) {
     const order = Array.from(harness.lastFrame().depthIndex);
     let minGap = Infinity;
     for (let k = 1; k < order.length; k++) {
-        minGap = Math.min(minGap, keys[order[k]] - keys[order[k - 1]]);
+        const previous = order[k - 1];
+        const current = order[k];
+        // Two time-invariant rows keep their relative order forever, so only
+        // pairs with an animated side bound the reuse decision.
+        if (!model.dynamicMask[previous] && !model.dynamicMask[current]) continue;
+        minGap = Math.min(minGap, keys[current] - keys[previous]);
     }
-    // The animated rows only translate, and the depth row of the view is a unit
-    // vector, so one unit of time moves a row by this many depth keys.
-    const keysPerTime =
-        Math.fround(DYNAMIC_VELOCITY) *
-        Math.hypot(VIEW_PROJECTION[2], VIEW_PROJECTION[6], VIEW_PROJECTION[10]) *
-        4096;
+    // The animated rows only translate, and the depth axis is a unit vector, so
+    // one unit of time moves a row by at most this many depth keys.
+    const keysPerTime = Math.fround(DYNAMIC_VELOCITY) * interval.scale;
     // The synthetic model stores scale code -2 on every axis, so a Gaussian
     // radius is exp(-2) world units and the budget counts radii.
-    const footprint =
-        Math.exp(-2) *
-        Math.hypot(VIEW_PROJECTION[2], VIEW_PROJECTION[6], VIEW_PROJECTION[10]) *
-        4096;
+    const footprint = Math.exp(-2) * interval.scale;
     const survive = (minGap / 2) / keysPerTime;
     return {
         minGap,
@@ -981,7 +1055,7 @@ test("adaptive scheduling reuses an order that the movement bound cannot break",
     // keeps drawing must still be the exact reference order at the new time.
     assert.deepEqual(
         harness.lastOrder(),
-        expectedOrder(model.positions, attributes, insideTime, VIEW_PROJECTION),
+        expectedOrder(model.positions, attributes, model.dynamicMask, insideTime, VIEW_PROJECTION),
     );
 
     await harness.sendTime(outsideTime, 2);
@@ -990,7 +1064,7 @@ test("adaptive scheduling reuses an order that the movement bound cannot break",
     assert.equal(frame.dynamicRequestId, 2);
     assert.deepEqual(
         harness.lastOrder(),
-        expectedOrder(model.positions, attributes, outsideTime, VIEW_PROJECTION),
+        expectedOrder(model.positions, attributes, model.dynamicMask, outsideTime, VIEW_PROJECTION),
     );
 });
 
@@ -1105,7 +1179,7 @@ test("a cull threshold drops the rows below it and keeps the camera-bound rows",
     );
     assert.deepEqual(
         order,
-        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION)
+        expectedOrder(model.positions, attributes, model.dynamicMask, 0, VIEW_PROJECTION)
             .filter((id) => kept.includes(id)),
         "the survivors keep the reference depth order",
     );
@@ -1188,7 +1262,7 @@ test("a threshold set after the camera prunes and zero restores it", async () =>
     assert.equal(restored.drawCount, model.count, "zero must restore every Gaussian");
     assert.deepEqual(
         Array.from(restored.depthIndex),
-        expectedOrder(model.positions, attributes, 0, VIEW_PROJECTION),
+        expectedOrder(model.positions, attributes, model.dynamicMask, 0, VIEW_PROJECTION),
         "restoring the threshold must restore the reference order",
     );
 });

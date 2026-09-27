@@ -19,7 +19,9 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const MAIN_JS = path.join(__dirname, "..", "render_shared", "main.js");
-const DEPTH_KEY_SCALE = 4096;
+// Eq. (31): B = 2^16 bins, so kappa = (B - 1) / (z_max - z_min).
+const DEPTH_BUCKETS = 256 * 256;
+const DEPTH_KEY_MAX = DEPTH_BUCKETS - 1;
 const DISPLAY_HZ = 60;
 
 // The bench only needs a fixed camera looking down the -z axis; the depth row
@@ -120,6 +122,7 @@ function loadWorker() {
         "        }",
         "    };",
         "    globalThis.__installScene = (scene) => {",
+        "        resetSortState();",
         "        const count = scene.count;",
         "        vertexCount = count;",
         "        buffer = new ArrayBuffer(count * 32);",
@@ -211,20 +214,85 @@ function createHarness() {
     };
 }
 
+// Unit depth axis of Eq. (31): the view-projection row the quantiser reads.
+function depthAxisOf() {
+    const norm = Math.hypot(VIEW_PROJECTION[2], VIEW_PROJECTION[6], VIEW_PROJECTION[10]);
+    if (!(norm > 0)) return [0, 0, 0];
+    return [
+        VIEW_PROJECTION[2] / norm,
+        VIEW_PROJECTION[6] / norm,
+        VIEW_PROJECTION[10] / norm,
+    ];
+}
+
+// [z_min, z_max] of Eq. (31) and kappa, mirrored from refreshDepthInterval:
+// measured over the decoded rows of both streams, then widened by the
+// worst-case travel of the animated subset over the clip.
+function depthIntervalOf(scene) {
+    const { positions, attributes, gate } = scene;
+    const count = scene.count;
+    const axis = depthAxisOf();
+    let low = Infinity;
+    let high = -Infinity;
+    for (let i = 0; i < count; i++) {
+        const z = axis[0] * positions[3 * i + 0] +
+            axis[1] * positions[3 * i + 1] + axis[2] * positions[3 * i + 2];
+        if (z < low) low = z;
+        if (z > high) high = z;
+    }
+    if (!(high > low)) {
+        const single = Number.isFinite(low) ? low : 0;
+        return { min: single, max: single, scale: 0 };
+    }
+    let speedBound = 0;
+    let accelBound = 0;
+    let timeMin = Infinity;
+    let timeMax = -Infinity;
+    for (let i = 0; i < count; i++) {
+        if (!gate[i]) continue;
+        const speed = Math.hypot(
+            attributes[8 * i + 0], attributes[8 * i + 1], attributes[8 * i + 2]);
+        if (speed > speedBound) speedBound = speed;
+        const accel = Math.hypot(
+            attributes[8 * i + 3], attributes[8 * i + 4], attributes[8 * i + 5]);
+        if (accel > accelBound) accelBound = accel;
+        const canonical = attributes[8 * i + 6];
+        if (canonical < timeMin) timeMin = canonical;
+        if (canonical > timeMax) timeMax = canonical;
+    }
+    if (!Number.isFinite(timeMin)) {
+        timeMin = 0;
+        timeMax = 0;
+    }
+    const tauMax = Math.max(0, timeMax, 1 - timeMin);
+    const travel = speedBound * tauMax + 0.5 * accelBound * tauMax * tauMax;
+    const min = low - travel;
+    const max = high + travel;
+    return { min, max, scale: DEPTH_KEY_MAX / (max - min) };
+}
+
+// Quantised depth of Eq. (31), q_i(t) = clip(floor(kappa * (z_i - z_min)), 0, B-1),
+// the key the worker itself orders by: displacement v*dt + 0.5*a*dt^2 past the
+// canonical position, projected onto the unit depth axis.
 function depthKeysAt(scene, time) {
-    const keys = new Float64Array(scene.count);
-    const { positions, attributes } = scene;
+    const keys = new Int32Array(scene.count);
+    const { positions, attributes, gate } = scene;
+    const interval = depthIntervalOf(scene);
+    const axis = depthAxisOf();
     for (let i = 0; i < scene.count; i++) {
-        const dt = time - attributes[8 * i + 6];
-        const half = 0.5 * dt * dt;
-        const x = positions[3 * i + 0] +
-            attributes[8 * i + 0] * dt + attributes[8 * i + 3] * half;
-        const y = positions[3 * i + 1] +
-            attributes[8 * i + 1] * dt + attributes[8 * i + 4] * half;
-        const z = positions[3 * i + 2] +
-            attributes[8 * i + 2] * dt + attributes[8 * i + 5] * half;
-        keys[i] = (VIEW_PROJECTION[2] * x + VIEW_PROJECTION[6] * y +
-            VIEW_PROJECTION[10] * z) * DEPTH_KEY_SCALE | 0;
+        let x = positions[3 * i + 0];
+        let y = positions[3 * i + 1];
+        let z = positions[3 * i + 2];
+        if (gate[i]) {
+            const dt = time - attributes[8 * i + 6];
+            const half = 0.5 * dt * dt;
+            x += attributes[8 * i + 0] * dt + attributes[8 * i + 3] * half;
+            y += attributes[8 * i + 1] * dt + attributes[8 * i + 4] * half;
+            z += attributes[8 * i + 2] * dt + attributes[8 * i + 5] * half;
+        }
+        const q = (interval.scale * (
+            axis[0] * x + axis[1] * y + axis[2] * z - interval.min)) | 0;
+        keys[i] = q < 0 ? 0 : (q > DEPTH_KEY_MAX ? DEPTH_KEY_MAX : q);
     }
     return keys;
 }
@@ -273,7 +341,7 @@ async function runConfig(harness, scene, options, config) {
     harness.resetCounters();
     messages.length = 0;
 
-    const footprintKeys = Math.exp(-2) * DEPTH_KEY_SCALE;
+    const footprintKeys = scene.scale * depthIntervalOf(scene).scale;
     const frames = Math.round(options.seconds * DISPLAY_HZ);
     const requestInterval = config.requestHz > 0 ? 1 / config.requestHz : 0;
     const sampleEvery = 5;
@@ -368,6 +436,7 @@ async function main() {
     await harness.send({ time: 0, dynamicRequestId: 0 });
     const animated = scene.gate.reduce((sum, value) => sum + value, 0);
 
+    const interval = depthIntervalOf(scene);
     const keys = depthKeysAt(scene, 0);
     const order = harness.messages.filter((message) => message.depthIndex).pop().depthIndex;
     let movable = 0;
@@ -380,7 +449,7 @@ async function main() {
         const gap = keys[current] - keys[previous];
         if (gap <= 2) tight++;
     }
-    const keysPerSecond = options.speed * DEPTH_KEY_SCALE *
+    const keysPerSecond = options.speed * interval.scale *
         Math.hypot(VIEW_PROJECTION[2], VIEW_PROJECTION[6], VIEW_PROJECTION[10]);
     const movementPerSort = keysPerSecond * (1 / options.requestHz) / options.seconds;
     const cullPixels = options.cull > 0 ? options.cull : 4;
@@ -389,18 +458,11 @@ async function main() {
     // camera plane.
     const cullReach = options.focal * Math.exp(-2) / cullPixels;
     const culledShare = Math.min(0.5, Math.max(0, 0.5 - cullReach / options.extent));
-    let keyMin = Infinity;
-    let keyMax = -Infinity;
-    for (let i = 0; i < keys.length; i++) {
-        if (keys[i] < keyMin) keyMin = keys[i];
-        if (keys[i] > keyMax) keyMax = keys[i];
-    }
-
     process.stdout.write([
         `scene      ${options.count.toLocaleString()} Gaussians, ` +
         `${animated.toLocaleString()} animated (${(100 * animated / options.count).toFixed(1)}%)`,
         `footprint  ${(Math.exp(-2)).toFixed(4)} world units = ` +
-        `${(Math.exp(-2) * DEPTH_KEY_SCALE).toFixed(0)} depth keys`,
+        `${(Math.exp(-2) * interval.scale).toFixed(3)} depth keys`,
         `playback   ${options.seconds}s clip over ${options.seconds}s wall time, ` +
         `${DISPLAY_HZ} Hz display, requests at ${options.requestHz} Hz`,
         `motion     about ${movementPerSort.toFixed(1)} depth keys between two requests`,
@@ -408,9 +470,8 @@ async function main() {
         `${cullReach.toFixed(1)} units drop out of the far half of the box, about ` +
         `${(100 * culledShare).toFixed(0)}% of all Gaussians`,
         `gaps       ${(100 * tight / movable).toFixed(1)}% of the ` +
-        `${movable.toLocaleString()} movable adjacent pairs are within 2 depth keys ` +
-        `(the 16 bit counting sort itself resolves about ` +
-        `${((keyMax - keyMin) / 65536).toFixed(1)} keys per bucket)`,
+        `${movable.toLocaleString()} movable adjacent pairs are within 2 bins of ` +
+        `Eq. (31) (B = ${DEPTH_BUCKETS} bins over ${(interval.max - interval.min).toFixed(2)} units)`,
         "",
     ].join("\n"));
 

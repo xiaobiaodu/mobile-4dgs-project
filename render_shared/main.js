@@ -391,13 +391,35 @@ function createWorker(self) {
     // rows that already overlap on screen.  It decides from the movement bound
     // alone and never pays for the gap measurement.
     const DEPTH_KEY_SCALE = 4096;      // must match quantizeDepth
+    // The renderer's 16 bit quantized depth key of the paper (Sec. IV-D):
+    //
+    //     q_i(t) = clip(floor(kappa * (z_i(t) - z_min)), 0, B - 1),
+    //     kappa  = (B - 1) / (z_max - z_min),     B = 2^16,
+    //
+    // where z_i = n . mu_i is the view-space depth along the unit depth axis n
+    // and [z_min, z_max] is one interval shared by both streams.  The axis and
+    // the interval are properties of the camera view, so the keys of the static
+    // stream depend on the camera alone and stay valid for the whole clip.  A
+    // model that carries an explicit static/dynamic gate is ordered in this key
+    // space; an export without one keeps the older int32 key, which leaves the
+    // pre-separation renderer untouched.
+    const DEPTH_BUCKETS = 256 * 256;   // B of Eq. (31)
+    const DEPTH_KEY_MAX = DEPTH_BUCKETS - 1;
+    const CAMERA_DEPTH_TOLERANCE = 0.01;   // relaxed-mode camera-change test
     let adaptiveSortEnabled = false;
     let adaptiveSortBudget = 0;            // allowed drift, in Gaussian radii
     let committedDepthTime = Number.NaN;   // time the cached order belongs to
     let depthGapMin = 0;                   // smallest movable adjacent depth gap
     let animatedFlags = null;              // Uint8Array: 1 for animated rows
-    let viewDepthRowNorm = 0;              // |depth row| of the sorted view
     let motionMeanScale = 0;               // mean Gaussian radius of the model
+    let twoStreamKeys = false;             // model carries a gate: the 16 bit key
+    let quantizedKeys = null;              // Uint16Array: q_i of Eq. (31)
+    let sortKeys = null;                   // key array the streams are ordered by
+    let depthAxis = null;                  // unit n of Eq. (31)
+    let depthIntervalMin = 0;              // z_min
+    let depthIntervalMax = 0;              // z_max
+    let depthKeyScale = 0;                 // kappa = (B - 1) / (z_max - z_min)
+    let depthMappingDirty = true;          // [z_min, z_max] must be measured again
     let dynamicSpeedBound = 0;             // max |velocity| over animated rows
     let dynamicAccelBound = 0;             // max |acceleration| over animated rows
     let canonicalTimeMin = 0;
@@ -430,7 +452,14 @@ function createWorker(self) {
         committedDepthTime = Number.NaN;
         depthGapMin = 0;
         animatedFlags = null;
-        viewDepthRowNorm = 0;
+        twoStreamKeys = false;
+        quantizedKeys = null;
+        sortKeys = null;
+        depthAxis = null;
+        depthIntervalMin = 0;
+        depthIntervalMax = 0;
+        depthKeyScale = 0;
+        depthMappingDirty = true;
         motionMeanScale = 0;
         dynamicSpeedBound = 0;
         dynamicAccelBound = 0;
@@ -794,6 +823,88 @@ function contractToUnisphereInPlace(x, y, z, out) {
         return ((viewProj[2] * x + viewProj[6] * y + viewProj[10] * z) * DEPTH_KEY_SCALE) | 0;
     }
 
+    // The key space of the current policy: the 16 bit keys of Eq. (31) for a
+    // gated model, the legacy int32 keys otherwise.
+    function refreshSortKeys() {
+        sortKeys = twoStreamKeys && quantizedKeys ? quantizedKeys : depthKeys;
+    }
+
+    // [z_min, z_max] of Eq. (31), measured over the decoded rows of both
+    // streams so the interval is shared by construction.  Together with the
+    // unit depth axis it defines kappa, and neither depends on the query time,
+    // which is what keeps the static keys valid for the whole clip.
+    function refreshDepthInterval() {
+        depthIntervalMin = 0;
+        depthIntervalMax = 0;
+        depthKeyScale = 0;
+        if (!buffer || vertexCount === 0 || !depthAxis) return;
+        const packed = new Float32Array(buffer);
+        const ax = depthAxis[0];
+        const ay = depthAxis[1];
+        const az = depthAxis[2];
+        let low = Infinity;
+        let high = -Infinity;
+        for (let i = 0; i < vertexCount; i++) {
+            const z = ax * packed[8 * i + 0] + ay * packed[8 * i + 1] + az * packed[8 * i + 2];
+            if (z < low) low = z;
+            if (z > high) high = z;
+        }
+        if (!(high > low)) {
+            depthIntervalMin = Number.isFinite(low) ? low : 0;
+            depthIntervalMax = depthIntervalMin;
+            return;
+        }
+        // An animated row can leave the canonical interval while the clip
+        // plays, and a row clipped onto a boundary would collapse onto its
+        // neighbour and force g_min = 0 for the whole commit.  The shared
+        // interval therefore also covers the worst-case travel of the animated
+        // subset over the clip, which the viewer plays as clip time in [0, 1].
+        // Both terms are model properties, so the interval still depends on the
+        // camera alone.
+        const tauMax = Math.max(0, canonicalTimeMax, 1 - canonicalTimeMin);
+        const travel = dynamicSpeedBound * tauMax +
+            0.5 * dynamicAccelBound * tauMax * tauMax;
+        depthIntervalMin = low - travel;
+        depthIntervalMax = high + travel;
+        depthKeyScale = DEPTH_KEY_MAX / (depthIntervalMax - depthIntervalMin);
+    }
+
+    // Track the depth mapping (n, [z_min, z_max]) of Eq. (31).  Under the
+    // certified policy of Sec. IV-D any change to the mapping invalidates the
+    // static cache and the committed draw list, so the test is exact; the
+    // relaxed interactive policy is allowed the tolerance test instead.
+    function updateDepthMapping(viewProj, exact) {
+        const x = viewProj[2];
+        const y = viewProj[6];
+        const z = viewProj[10];
+        const norm = Math.hypot(x, y, z);
+        if (!(norm > 0)) return false;
+        const ax = x / norm;
+        const ay = y / norm;
+        const az = z / norm;
+        if (depthAxis) {
+            if (exact) {
+                if (ax === depthAxis[0] && ay === depthAxis[1] && az === depthAxis[2]) {
+                    return false;
+                }
+            } else {
+                const dot = ax * depthAxis[0] + ay * depthAxis[1] + az * depthAxis[2];
+                if (Math.abs(dot - 1) < CAMERA_DEPTH_TOLERANCE) return false;
+            }
+        }
+        depthAxis = [ax, ay, az];
+        depthMappingDirty = true;
+        return true;
+    }
+
+    // Quantised key of Eq. (31) for one row.  kappa * (z - z_min) is
+    // non-negative for a row inside the interval and truncating towards zero
+    // bounds one from outside it, so the clip below is the whole guard.
+    function quantizeKey(keyX, keyY, keyZ, keyScale, keyMin, x, y, z) {
+        const q = (keyScale * (keyX * x + keyY * y + keyZ * z - keyMin)) | 0;
+        if (q < 0) return 0;
+        return q > DEPTH_KEY_MAX ? DEPTH_KEY_MAX : q;
+    }
     function ensureSortBuffers() {
         if (depthKeys && depthKeys.length === vertexCount) return;
         if (!staticIds || !dynamicIds) {
@@ -803,10 +914,14 @@ function contractToUnisphereInPlace(x, y, z, out) {
             buildGaussianSplit(null, hasDynamicMotion, vertexCount);
         }
         depthKeys = new Int32Array(vertexCount);
+        quantizedKeys = new Uint16Array(vertexCount);
+        refreshSortKeys();
+        // A new buffer re-measures the shared interval of Eq. (31).
+        depthMappingDirty = true;
         allocateOrderBuffers();
         sortBuckets = new Int32Array(vertexCount);
-        sortCounts = new Uint32Array(256 * 256);
-        sortStarts = new Uint32Array(256 * 256);
+        sortCounts = new Uint32Array(DEPTH_BUCKETS);
+        sortStarts = new Uint32Array(DEPTH_BUCKETS);
     }
 
     // The order buffers follow the stream sizes, so a level change resizes them,
@@ -841,12 +956,22 @@ function contractToUnisphereInPlace(x, y, z, out) {
         const cullFocal = focalPixels;
         const cullThreshold = minPixelRadius;
         let count = 0;
+        const quantized = twoStreamKeys;
+        const keyScale = depthKeyScale;
+        const keyMin = depthIntervalMin;
+        const keyX = depthAxis ? depthAxis[0] : 0;
+        const keyY = depthAxis ? depthAxis[1] : 0;
+        const keyZ = depthAxis ? depthAxis[2] : 0;
         for (let n = 0; n < staticIds.length; n++) {
             const i = staticIds[n];
             const x = f_buffer[8 * i + 0];
             const y = f_buffer[8 * i + 1];
             const z = f_buffer[8 * i + 2];
-            depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            if (quantized) {
+                quantizedKeys[i] = quantizeKey(keyX, keyY, keyZ, keyScale, keyMin, x, y, z);
+            } else {
+                depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            }
             // A row on or behind the camera plane has no radius to bound, so
             // the vertex shader's clip test is what decides it.
             let keep = true;
@@ -881,6 +1006,12 @@ function contractToUnisphereInPlace(x, y, z, out) {
         const cullFocal = focalPixels;
         const cullThreshold = minPixelRadius;
         let count = 0;
+        const quantized = twoStreamKeys;
+        const keyScale = depthKeyScale;
+        const keyMin = depthIntervalMin;
+        const keyX = depthAxis ? depthAxis[0] : 0;
+        const keyY = depthAxis ? depthAxis[1] : 0;
+        const keyZ = depthAxis ? depthAxis[2] : 0;
         for (let n = 0; n < dynamicIds.length; n++) {
             const i = dynamicIds[n];
             let x = f_buffer[8 * i + 0];
@@ -894,7 +1025,11 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 y += dynamicBuffer[dynamicOffset + 1] * dt + dynamicBuffer[dynamicOffset + 4] * halfDtSquared;
                 z += dynamicBuffer[dynamicOffset + 2] * dt + dynamicBuffer[dynamicOffset + 5] * halfDtSquared;
             }
-            depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            if (quantized) {
+                quantizedKeys[i] = quantizeKey(keyX, keyY, keyZ, keyScale, keyMin, x, y, z);
+            } else {
+                depthKeys[i] = quantizeDepth(viewProj, x, y, z);
+            }
             // A row on or behind the camera plane has no radius to bound, so
             // the vertex shader's clip test is what decides it.
             let keep = true;
@@ -935,28 +1070,45 @@ function contractToUnisphereInPlace(x, y, z, out) {
     const screenSpaceCullArmed = () =>
         minPixelRadius > 0 && focalPixels > 0 && Boolean(viewDepthRow);
 
-    // 16 bit single-pass counting sort over one stream.  `ids` is in ascending
-    // Gaussian order, so Gaussians sharing a depth bucket stay ordered by their
-    // original row id - the tie-break the reference renderer uses as well.
+    // Single-pass counting sort over one stream.  `ids` is in ascending Gaussian
+    // order, so equal keys keep their row order, which is the row-id tie-break
+    // of Eq. (32).  In the 16 bit key space of Eq. (31) every bucket is exactly
+    // one value of q_i, so this single stable pass reproduces argsort(q_i, i).
+    // The legacy int32 path keeps the relative bucketisation it always had.
     function sortStream(ids, order) {
         const count = ids.length;
         if (count === 0) return;
+        sortCounts.fill(0);
+        if (twoStreamKeys) {
+            for (let n = 0; n < count; n++) {
+                const bucket = sortKeys[ids[n]];
+                sortBuckets[n] = bucket;
+                sortCounts[bucket]++;
+            }
+            sortStarts[0] = 0;
+            for (let i = 1; i < DEPTH_BUCKETS; i++) {
+                sortStarts[i] = sortStarts[i - 1] + sortCounts[i - 1];
+            }
+            for (let n = 0; n < count; n++) {
+                order[sortStarts[sortBuckets[n]]++] = ids[n];
+            }
+            return;
+        }
         let maxDepth = -Infinity;
         let minDepth = Infinity;
         for (let n = 0; n < count; n++) {
-            const depth = depthKeys[ids[n]];
+            const depth = sortKeys[ids[n]];
             if (depth > maxDepth) maxDepth = depth;
             if (depth < minDepth) minDepth = depth;
         }
-        const depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
-        sortCounts.fill(0);
+        const depthInv = DEPTH_KEY_MAX / (maxDepth - minDepth);
         for (let n = 0; n < count; n++) {
-            const bucket = ((depthKeys[ids[n]] - minDepth) * depthInv) | 0;
+            const bucket = ((sortKeys[ids[n]] - minDepth) * depthInv) | 0;
             sortBuckets[n] = bucket;
             sortCounts[bucket]++;
         }
         sortStarts[0] = 0;
-        for (let i = 1; i < 256 * 256; i++) {
+        for (let i = 1; i < DEPTH_BUCKETS; i++) {
             sortStarts[i] = sortStarts[i - 1] + sortCounts[i - 1];
         }
         for (let n = 0; n < count; n++) {
@@ -974,8 +1126,8 @@ function contractToUnisphereInPlace(x, y, z, out) {
         while (s < staticCount && d < dynamicCount) {
             const staticId = staticOrder[s];
             const dynamicId = dynamicOrder[d];
-            const staticDepth = depthKeys[staticId];
-            const dynamicDepth = depthKeys[dynamicId];
+            const staticDepth = sortKeys[staticId];
+            const dynamicDepth = sortKeys[dynamicId];
             if (staticDepth < dynamicDepth ||
                 (staticDepth === dynamicDepth && staticId <= dynamicId)) {
                 mergedOrder[out++] = staticId;
@@ -1038,7 +1190,7 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 !animatedFlags[previous] && !animatedFlags[current]) {
                 continue;
             }
-            const gap = depthKeys[current] - depthKeys[previous];
+            const gap = sortKeys[current] - sortKeys[previous];
             if (gap < depthGapMin) depthGapMin = gap;
         }
         if (!Number.isFinite(depthGapMin)) depthGapMin = 0;
@@ -1072,23 +1224,29 @@ function contractToUnisphereInPlace(x, y, z, out) {
             Math.abs(committedDepthTime - canonicalTimeMin),
             Math.abs(committedDepthTime - canonicalTimeMax),
         );
-        return viewDepthRowNorm * (
+        // Eq. (36) for the unit depth axis, in the keys of Eq. (31): the
+        // animated rows of the clip travel at most this many keys per unit of
+        // clip time.
+        return depthKeyScale * (
             dynamicSpeedBound +
             0.5 * dynamicAccelBound * (tauTime + tauCommitted)
-        ) * DEPTH_KEY_SCALE;
+        );
     }
 
     function predictedDepthMovement(time) {
         if (!Number.isFinite(committedDepthTime)) return Number.POSITIVE_INFINITY;
         const elapsed = Math.abs(time - committedDepthTime);
         if (!(elapsed > 0)) return 0;
-        return elapsed * predictedDepthRate(time);
+        // Eq. (37): M(t) = ceil(kappa * Delta_z(t)).
+        return Math.ceil(elapsed * predictedDepthRate(time));
     }
 
     // Depth drift the budget allows at this camera and time, in depth keys.
     function adaptiveTolerance() {
         if (!(adaptiveSortBudget > 0) || !(motionMeanScale > 0)) return 0;
-        return adaptiveSortBudget * motionMeanScale * viewDepthRowNorm * DEPTH_KEY_SCALE;
+        // Eq. (41), budget branch: kappa * r * mean radius, the unit depth
+        // axis contributing nothing to the norm.
+        return Math.ceil(depthKeyScale * adaptiveSortBudget * motionMeanScale);
     }
 
     // True when the committed order can serve as the draw order for `time`.
@@ -1099,13 +1257,15 @@ function contractToUnisphereInPlace(x, y, z, out) {
         const movement = predictedDepthMovement(time);
         if (!(movement > 0)) return true;
         if (adaptiveSortBudget > 0) {
-            // Tolerance policy: the order may drift, but by less than a Gaussian
-            // footprint, where a swap only reorders rows that overlap anyway.
+            // Budget branch of Eq. (41): the order may drift, but by less than
+            // r mean Gaussian radii, so a swap can only exchange rows that
+            // already overlap on screen.
             return movement <= adaptiveTolerance();
         }
-        // Exact policy: no pair can reach a tie, so the draw list is not merely
-        // close to the sorted order, it is the order the sort would produce.
-        return Math.ceil(2 * movement) < depthGapMin;
+        // Certified branch of Eq. (39): twice the drift bound stays below the
+        // tightest movable gap, so the committed list is not merely close to
+        // the sorted order, it is the order the sort would produce.
+        return 2 * movement < depthGapMin;
     }
 
     function runSort(viewProj) {
@@ -1117,19 +1277,27 @@ function contractToUnisphereInPlace(x, y, z, out) {
             dynamicPointCount > 0 &&
             (!Number.isFinite(lastDynamicSortTime) || Math.abs(dynamicTime - lastDynamicSortTime) > 1e-6);
 
+        // Sec. IV-D: the depth mapping is the pair (n, [z_min, z_max]).  Under
+        // the certified policy any change to it invalidates the static cache
+        // and the committed draw list, so the test is exact; the relaxed policy
+        // is allowed the tolerance test of the interactive viewer.
+        const certifiedSchedule = adaptiveSortEnabled && adaptiveSortBudget <= 0;
+        const mappingMoved = twoStreamKeys &&
+            updateDepthMapping(viewProj, certifiedSchedule);
+
         let viewChanged = true;
-        if (lastVertexCount == vertexCount) {
+        if (!mappingMoved && lastVertexCount == vertexCount) {
             let dot =
                 lastProj[2] * viewProj[2] +
                 lastProj[6] * viewProj[6] +
                 lastProj[10] * viewProj[10];
-            viewChanged = Math.abs(dot - 1) >= 0.01;
+            viewChanged = Math.abs(dot - 1) >= CAMERA_DEPTH_TOLERANCE;
         }
         if (lastVertexCount != vertexCount) {
             generateTexture();
             lastVertexCount = vertexCount;
         } else if (!viewChanged && !dynamicTimeChanged && !pendingDynamicFrame &&
-            !lodDirty && !cullDirty) {
+            !lodDirty && !cullDirty && !depthMappingDirty) {
             return;
         }
         // Consumed here: the guard above is the only place that can skip them,
@@ -1141,8 +1309,8 @@ function contractToUnisphereInPlace(x, y, z, out) {
         // order: when the animated rows are provably too slow to close any
         // neighbouring depth gap, nothing has to be re-projected, re-sorted,
         // merged or uploaded, and the main thread leaves the index buffer as is.
-        if (adaptiveSortEnabled && !viewChanged && hasDynamicMotion &&
-            dynamicPointCount > 0 && pendingDynamicFrame &&
+        if (adaptiveSortEnabled && !viewChanged && !depthMappingDirty &&
+            hasDynamicMotion && dynamicPointCount > 0 && pendingDynamicFrame &&
             canReuseDepthOrder(dynamicTime)) {
             const request = pendingDynamicFrame;
             pendingDynamicFrame = null;
@@ -1157,6 +1325,14 @@ function contractToUnisphereInPlace(x, y, z, out) {
         }
 
         ensureSortBuffers();
+        // The streams are about to be quantised, so a stale interval would
+        // measure their keys against the wrong [z_min, z_max].  This runs
+        // after the buffers, because (re)allocating them re-measures the
+        // interval from the decoded rows.
+        if (twoStreamKeys && depthMappingDirty) {
+            refreshDepthInterval();
+            depthMappingDirty = false;
+        }
         const staticResorted = viewChanged || !staticOrderValid;
         const dynamicResorted = viewChanged || dynamicTimeChanged || !dynamicOrderValid;
         let streamsChanged = false;
@@ -1203,9 +1379,9 @@ function contractToUnisphereInPlace(x, y, z, out) {
                 : dynamicOrder.subarray(0, dynamicVisibleCount));
         committedDrawCount = drawOrder.length;
         if (adaptiveSortEnabled && hasDynamicMotion) {
-            // The cached order is committed at this time, and the gap histogram
-            // tells the next playback frame how much movement it can absorb.
-            viewDepthRowNorm = Math.hypot(viewProj[2], viewProj[6], viewProj[10]);
+            // The cached order is committed at this time, and the tightest
+            // movable gap of Eq. (38) tells the next playback frame how much
+            // movement it can absorb.
             committedDepthTime = dynamicTime;
             if (adaptiveSortBudget <= 0) {
                 refreshAdaptiveGapMin(drawOrder);
@@ -1571,6 +1747,11 @@ function contractToUnisphereInPlace(x, y, z, out) {
     // gate metadata the export keeps the older semantics: a dynamic model moves
     // every Gaussian, a static model moves none of them.
     function buildGaussianSplit(gate, hasDynamicMotion, pointCount) {
+        // An explicit gate means the export carries the static/dynamic
+        // partition of the paper, so both streams are ordered in the 16 bit key
+        // space of Eq. (31); an export without one keeps the legacy int32 key.
+        twoStreamKeys = Boolean(gate);
+        refreshSortKeys();
         let animated;
         if (gate) {
             animated = gate;
@@ -1649,6 +1830,8 @@ function contractToUnisphereInPlace(x, y, z, out) {
         }
         applyLodFraction();
         refreshAdaptiveMotionBounds();
+        // A different level can keep faster rows, which widens the interval.
+        depthMappingDirty = true;
         lodDirty = true;
         postSplitInfo();
         throttledSort();
