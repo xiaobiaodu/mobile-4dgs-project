@@ -89,8 +89,9 @@
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column has-text-centered">
-          <h1 class="title is-1 publication-title">Mobile-GS: Real-time Gaussian Splatting for Mobile Devices</h1>
-                                  <h1 class="title is-3 publication-title">ICLR 2026</h1>
+          <h1 class="title is-1 publication-title">: Mobile-4DGS: Unified Static-Dynamic Real-time
+Mobile Gaussian Splatting</h1>
+                                  <!-- <h1 class="title is-3 publication-title">ICLR 2026</h1> -->
 
           <div class="is-size-5 publication-authors">
              <span class="author-block">
@@ -100,24 +101,30 @@
 
 
 
-            <!-- <span class="author-block">
+            <span class="author-block">
               <a href="https://xiaobiaodu.github.io/">Xiaobiao Du</a><sup></sup></span>&nbsp;&nbsp;&nbsp;&nbsp;
             <span class="author-block">
-              <a href="https://wangyida.github.io/">Yida Wang</a><sup></sup>
+              <a href="">Beixi Hao</a><sup></sup>
             </span>&nbsp;&nbsp;&nbsp;&nbsp;
             <span class="author-block">
-              <a >Kun Zhan</a><sup></sup> &nbsp;&nbsp;&nbsp;&nbsp;
+              <a >Zheng Fang</a><sup></sup> &nbsp;&nbsp;&nbsp;&nbsp;
+            </span>
+              <span class="author-block">
+              <a >Tianqing Zhu</a><sup></sup> &nbsp;&nbsp;&nbsp;&nbsp;
+            </span>
+             <span class="author-block">
+              <a >Richard Hartley</a><sup></sup> &nbsp;&nbsp;&nbsp;&nbsp;
             </span>
             <span class="author-block">
-              <a href="https://sites.google.com/view/xinyus-homepage/Home">Xin Yu</a><sup></sup>
+              <a href="https://xinyu-au.github.io/">Xin Yu</a><sup></sup>
             </span>
-          </div> -->
+          </div>
 
           <div class="column has-text-centered">
             <div class="publication-links">
               <!-- PDF Link. -->
               <span class="link-block">
-               <a href="https://arxiv.org/abs/2603.11531"
+               <a href=""
                    class="external-link button is-normal is-rounded is-dark">
                   <span class="icon">
                       <i class="fas fa-file-pdf"></i>
@@ -174,7 +181,7 @@
                 type="video/mp4">
       </video>
       <h2 class="subtitle has-text-centered">
-        <span class="highlight" >Mobile-GS</span> achieves real-time rendering for challenging unbounded scenes on mobile platforms. It easily break through the 120 display FPS limit for fluent rendering</span>
+        <span class="highlight" >Mobile-4DGS</span> achieves real-time rendering for challenging both dynamic and static scenes on mobile platforms. </span>
       </h2>
     </div>
   </div>
@@ -271,18 +278,7 @@
         <h2 class="title is-3">Abstract</h2>
         <div class="content has-text-justified">
           <p>
-
- 3D Gaussian Splatting (3DGS) has emerged as a powerful representation for high-quality rendering across a wide range of applications.
-    However, its high computational demands and large storage costs pose significant challenges for deployment on mobile devices.
-    In this work, we propose a mobile-tailored real-time Gaussian Splatting method, dubbed Mobile-GS, enabling efficient inference of Gaussian Splatting on edge devices.
-    Specifically, we first identify alpha blending as the primary computational bottleneck, since it relies on the time-consuming Gaussian depth sorting process.
-    To solve this issue, we propose a depth-aware order-independent rendering scheme that eliminates the need for sorting, thereby substantially accelerating rendering.
-    Although this order-independent rendering improves rendering speed, it may introduce transparency artifacts in regions with overlapping geometry due to the scarcity of rendering order.
-    To address this problem, we propose a neural view-dependent enhancement strategy, enabling more accurate modeling of view-dependent effects conditioned on viewing direction, 3D Gaussian geometry, and appearance attributes.
-    In this way, Mobile-GS can achieve both high-quality and real-time rendering.
-        Furthermore, to facilitate deployment on memory-constrained mobile platforms, we introduce first-degree spherical harmonics distillation, a neural vector quantization technique, and a contribution-based pruning strategy to reduce the number of Gaussian primitives and compress the 3D Gaussian representation with the assistance of neural networks.
-    Extensive experiments demonstrate that our proposed Mobile-GS achieves real-time rendering and compact model size while preserving high visual quality, making it well-suited for mobile applications.
-    Code will be released.
+Recent advances in 3D Gaussian Splatting (3DGS) have achieved remarkable performance in novel view synthesis, yet deploying both static and dynamic Gaussian representations on resource-constrained mobile devices remains challenging due to heavy storage, redundant primitives, and costly per-frame computation. We present Mobile-4DGS, a unified lightweight framework for high-fidelity real-time static and dynamic Gaussian rendering on mobile platforms. For compact appearance modeling, we introduce a Monte Carlo Specular Energy Aggregator that compresses high-order radiance residuals into the first-order Spherical Harmonics (SH), together with an Attribute-Conditioned SH Enhancement module whose predicted offsets are pre-baked before inference. We further propose a Multi-View Alpha-Based Densification and Pruning strategy to suppress redundant primitives while maintaining multi-view consistency. For dynamic scenes, we develop a compact explicit 4D representation by constructing second-order Gaussian motion, learnable temporal support, and a binary static–dynamic partition, enabling continuous-time modeling without runtime deformation networks. Based on this partition, a Depth-Order Certificate selectively reuses previously committed depth orders to reduce re-projection, sorting, merging, and index-buffer updates during playback. Extensive experiments on static and dynamic scenes demonstrate that Mobile-4DGS substantially reduces storage and rendering overhead while maintaining competitive visual quality, enabling real-time 3D and 4D Gaussian Splatting on mobile devices.
  <p>
 
         </div>
