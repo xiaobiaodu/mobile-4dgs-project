@@ -89,7 +89,7 @@
     <div class="container is-max-desktop">
       <div class="columns is-centered">
         <div class="column has-text-centered">
-          <h1 class="title is-1 publication-title">: Mobile-4DGS: Unified Static-Dynamic Real-time
+          <h1 class="title is-1 publication-title">Mobile-4DGS: Unified Static-Dynamic Real-time
 Mobile Gaussian Splatting</h1>
                                   <!-- <h1 class="title is-3 publication-title">ICLR 2026</h1> -->
 
@@ -290,91 +290,47 @@ Recent advances in 3D Gaussian Splatting (3DGS) have achieved remarkable perform
 
 <hr>
 
-</section class="section">
-  <div class="container is-max-desktop">
-        <h2 class="title is-3">Introduction</h2>
 
-      <img src="static/images/teaser.png" alt="">
-<p>
-   <span class="highlight" >Mobile-GS</span> is the first real-time Gaussian Splatting method that can reach 116 FPS rendering speed in the 1600 x 1063 resolution on the mobile equipped with the Snapdragon 8 Gen 3 GPU as shown in (a).
-  We evaluate rendering quality, storage costs, and inference speed on an RTX 3090 GPU in (b) and (c).
-  Our Mobile-GS integrates depth-aware order-independent rendering, compression,
-    and distillation techniques to deliver comparable rendering quality compared with the original 3DGS, 
-    while substantially reducing the storage requirements to <span class="highlight" >4.8MB</span> and achieving <span class="highlight" >1098FPS</span> on the unbounded scene, thereby enabling efficient deployment on mobile devices.
-    
-</p>
 
-  </div>
-</section>
 
-<hr>
+
+
+
+
 
 </section class="section">
   <div class="container is-max-desktop">
         <h2 class="title is-3">Motivation</h2>
 
-      <img src="static/images/motivation.png" alt="">
+      <img src="static/images/sh.png" alt="">
 <p>
-    <span class="highlight" >We found sorting as the primary performance bottleneck.</span>
 
-  <span class="highlight" >Left:</span> Runtime analysis of the original 3DGS highlights that the sorting operation incurs a significant computational overhead during inference.
-  <span class="highlight" >Right:</span> Removing the sorting step substantially accelerates 3DGS, achieving several-fold speedup compared to the original implementation.
-</p>
+  <span class="highlight" >Left:</span> Per Gaussian memory footprint across 3DGS variants. Mobile-4DGS achieves significant compression (61\% and 26\% reductions) by optimizing Spherical Harmonics (SH) coefficients and decoupling SH into the base and view-independent components. 
+  
+  <span class="highlight" >Right:</span>  Qualitative comparison demonstrates that Mobile-4DGS with only first-order SH can render high-fidelity high-frequency details comparable to 3DGS.
 
   </div>
 </section>
 
 <hr>
 
+
 </section class="section">
   <div class="container is-max-desktop">
-        <h2 class="title is-3">Rendering Pipeline</h2>
+        <h2 class="title is-3">Motivation</h2>
 
       <img src="static/images/method.png" alt="">
 <p>
 
-    In the inference stage, different from 3DGS, our proposed method eliminates the tile-based rendering and the 3D Gaussian sorting process typically required for accurate alpha blending. 
-    Instead, we render all 3D Gaussians associated with a target pixel in a single pass. 
-    To further improve performance and maintain visual quality, we propose a depth-aware order-independent rendering strategy that replaces the original sorting-dependent alpha blending.
-</p>
-
-  </div>
-</section>
-
-
-<hr>
-
-</section class="section">
-  <div class="container is-max-desktop">
-        <h2 class="title is-3">High-valued Opacity</h2>
-
-      <img src="static/images/opacity.png" alt="">
-<p>
-
-Left: We leverage an MLP fed with 3D Gaussian scale, rotation, spherical harmonics, and the vector of the camera toward the 3D Gaussian as input to predict a view-dependent opacity.
-    Right:  We display that our Mobile-GS removes redundant opacity and keeps important Gaussians with high opacity.
-</p>
+  <span class="highlight" >Overview of the Mobile-4DGS framework.</span> Our method optimizes third-order SH for the initial 3k iterations, then transitions via Monte Carlo Specular Energy Aggregator for high-frequency representation. With the first-order direction moments inherited from the original third-order SH, we leverage a neural network to aggregate these latents into first-order SH $c'$ for rendering.  
+    During inference, the model requires only a one-time decoding step to obtain the first-order SH coefficients, significantly reducing storage while introducing no per-frame decoding overhead.
+  
 
   </div>
 </section>
 
 <hr>
 
-</section class="section">
-  <div class="container is-max-desktop">
-        <h2 class="title is-3">Runtime Analysis</h2>
-
-      <img src="static/images/runtime.png" alt="">
-<p>
-
-We further provide a detailed runtime analysis of our proposed Mobile-GS evaluated on four representative scenes, covering both indoor and 
-outdoor environments from the Mip-NeRF 360 dataset. The reported runtime accounts for all essential components involved in the rendering pipeline, 
-including the lightweight MLPs used for view-dependent effects.
- Despite the inclusion of MLPs, which are often regarded as computationally demanding, our design introduces minimal overhead.
-  This demonstrates that Mobile-GS maintains a favorable balance between computational efficiency and model expressiveness, 
-  ensuring real-time performance without compromising visual fidelity.
-
-</p>
 
   </div>
 </section>
