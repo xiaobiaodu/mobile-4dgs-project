@@ -336,7 +336,28 @@ Recent advances in 3D Gaussian Splatting (3DGS) have achieved remarkable perform
 </section>
 
 <hr>
+</section class="section">
+  <div class="container is-max-desktop">
+        <h2 class="title is-3">Implicit Static-dynamic Partion</h2>
+ <video autoplay muted loop playsinline controls>
+        <source src="./static/videos/partition.mp4"
+                type="video/mp4">
+      </video>
+      <!-- <img src="static/videos/partition.mp4" alt=""> -->
+<p>
 
+  <!-- <span class="highlight" >Overview of the Mobile-4DGS framework.</span>  -->
+  This video illustrates the central decomposition of our approach on the N3DV flame_steak sequence: the final render is exactly the sum of a dynamic branch and a static branch, dynamic + static = render, yet this partition is never supervised. Each Gaussian carries a learnable gate that is relaxed into a binary decision during training, so the model itself decides whether a Gaussian must move over time or can remain time-invariant. The only driving force is the photometric reconstruction objective, together with a sparsity pressure that encourages as much of the scene as possible to stay static and a binarization pressure that pushes each gate towards a clear decision before the partition is frozen. No segmentation masks, motion labels, or flow supervision are used at any point. 
+</div>
+</section>
+
+<hr>
+
+
+  </div>
+</section>
+
+<hr>
 <!-- </section class="section">
   <div class="container is-max-desktop">
 
